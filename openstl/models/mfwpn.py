@@ -4,34 +4,119 @@ import torch.nn.functional as F
 import numpy as np
 import copy
 import numbers
+from typing import Iterable, Optional, Sequence, Tuple
 from einops import rearrange
 from openstl.modules import (ConvSC, GASubBlock)
+
+
+def _validate_turbine_coords(coords: Iterable[Tuple[int, int]], height: int, width: int) -> Sequence[Tuple[int, int]]:
+    validated = []
+    for idx, coord in enumerate(coords):
+        if len(coord) != 2:
+            raise ValueError(f"Turbine coordinate at index {idx} must contain two values (h, w), got {coord}.")
+        h, w = int(coord[0]), int(coord[1])
+        if not (0 <= h < height and 0 <= w < width):
+            raise ValueError(
+                f"Turbine coordinate {(h, w)} is outside the feature map with shape ({height}, {width}).")
+        validated.append((h, w))
+    return validated
+
+
+class TurbinePowerHead(nn.Module):
+    """Predict turbine power from shared spatiotemporal features."""
+
+    def __init__(self, in_channels: int, turbine_coords: Sequence[Tuple[int, int]], roi_size: int = 5,
+                 conv_channels: int = 32, mlp_hidden_dim: int = 64, feature_hw: Tuple[int, int] = (64, 80)):
+        super().__init__()
+        if roi_size % 2 == 0 or roi_size <= 0:
+            raise ValueError(f"roi_size must be a positive odd number, got {roi_size}.")
+
+        self.roi_size = roi_size
+        self.pad = roi_size // 2
+        self.feature_hw = feature_hw
+        self.turbine_coords = _validate_turbine_coords(turbine_coords, *feature_hw)
+        self.num_turbines = len(self.turbine_coords)
+
+        conv_hidden = max(conv_channels, in_channels)
+        self.local_conv = nn.Sequential(
+            nn.Conv2d(in_channels, conv_hidden, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(conv_hidden),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(conv_hidden, conv_hidden, kernel_size=3, padding=1, bias=False),
+            nn.ReLU(inplace=True),
+        )
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.regressor = nn.Sequential(
+            nn.Linear(conv_hidden, mlp_hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(mlp_hidden_dim, 1)
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        """Compute power predictions.
+
+        Args:
+            features: Tensor of shape [B, T, C, H, W].
+
+        Returns:
+            Power predictions shaped [B, T, N_turbines, 1].
+        """
+        b, t, c, h, w = features.shape
+        if (h, w) != self.feature_hw:
+            raise ValueError(f"Unexpected feature map size {(h, w)}; expected {self.feature_hw} for turbine decoding.")
+
+        x = features.reshape(b * t, c, h, w)
+        x = F.pad(x, (self.pad, self.pad, self.pad, self.pad), mode='replicate')
+
+        power_outputs = []
+        for h_idx, w_idx in self.turbine_coords:
+            center_h = h_idx + self.pad
+            center_w = w_idx + self.pad
+            patch = x[:, :, center_h - self.pad:center_h + self.pad + 1,
+                      center_w - self.pad:center_w + self.pad + 1]
+            local_feat = self.local_conv(patch)
+            pooled = self.pool(local_feat).reshape(b, t, -1)
+            regressed = self.regressor(pooled.reshape(b * t, -1)).reshape(b, t, 1)
+            power_outputs.append(regressed)
+
+        return torch.stack(power_outputs, dim=2)
 
 
 class MFWPN_Model(nn.Module):
     def __init__(self, hid_S=2, hid_T=256, N_S=2, N_T=8, model_type='gsta',
                  mlp_ratio=8., drop=0.0, drop_path=0.0, spatio_kernel_enc=3,
-                 spatio_kernel_dec=3, act_inplace=True, **kwargs):
+                 spatio_kernel_dec=3, act_inplace=True, turbine_coords: Optional[Sequence[Tuple[int, int]]] = None,
+                 power_roi_size: int = 5, power_conv_channels: int = 32, power_mlp_hidden: int = 64,
+                 feature_hw: Tuple[int, int] = (64, 80), **kwargs):
         super(MFWPN_Model, self).__init__()
         T, C, H, W = 24, 2, 64, 80  # T is pre_seq_length
-        H, W = 64, 80
         act_inplace = False
         self.enc = Encoder(spatio_kernel=spatio_kernel_enc, act_inplace=True)
         self.dec = Decoder(spatio_kernel=spatio_kernel_dec, act_inplace=True)
         self.hid_w = MidMetaNet(T*hid_S, hid_T, N_T, input_resolution=(64, 80), model_type=model_type,
-                                mlp_ratio=mlp_ratio, drop=drop, drop_path=drop_path)    
+                                mlp_ratio=mlp_ratio, drop=drop, drop_path=drop_path)
         self.hid_tz = MidMetaNet(T*hid_S, hid_T, N_T, input_resolution=(64, 80), model_type=model_type,
                                 mlp_ratio=mlp_ratio, drop=drop, drop_path=drop_path)
         self.channel_f = CAM(channel = 48)
-        self.channel_i = CAM(channel = 48) 
+        self.channel_i = CAM(channel = 48)
         self.gate = nn.Tanh()
         self.ele_conv = nn.Sequential(
             nn.Conv2d(48, 48, kernel_size=3, stride=1, padding=1),
             nn.Conv2d(48, 48, kernel_size=1, stride=1))
-          
+        self.power_head: Optional[TurbinePowerHead] = None
+        if turbine_coords:
+            self.power_head = TurbinePowerHead(
+                in_channels=hid_S,
+                turbine_coords=turbine_coords,
+                roi_size=power_roi_size,
+                conv_channels=power_conv_channels,
+                mlp_hidden_dim=power_mlp_hidden,
+                feature_hw=feature_hw
+            )
+
     def forward(self, x_raw, ele, **kwargs):
         B, T, C, H, W = x_raw.shape
-        
+
         ele = ele[None, None, :, :]
         ele_h = ele
         ele = ele.repeat(B*T,1,1,1)
@@ -50,12 +135,19 @@ class MFWPN_Model(nn.Module):
         ####time fusion
         hid_w = hid_w * self.channel_f(hid_tz) + self.channel_i(hid_tz) * self.gate(hid_tz)  
         hid_w = hid_w.reshape(B , T, C_w, H_, W_)
-        hid_w = hid_w.reshape(B * T, C_w, H_, W_)
-        
-        Y = self.dec(hid_w)      
+
+        power_pred = None
+        if self.power_head is not None:
+            power_pred = self.power_head(hid_w)
+
+        dec_input = hid_w.reshape(B * T, C_w, H_, W_)
+        Y = self.dec(dec_input)
         Y = Y.reshape(B, T, 2, H, W)
 
-        return Y
+        outputs = {'wind': Y}
+        if power_pred is not None:
+            outputs['power'] = power_pred
+        return outputs
     
 class SAM(nn.Module):
     def __init__(self, spatial_kernel=7):

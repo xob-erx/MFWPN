@@ -21,10 +21,12 @@ class data_process(Dataset):
         super().__init__()
         
         uv = []
+        self.indices = None
         if ossit is not None:
             assert len(ossit.shape) == 4
-            idx_uv = prepare_inputs_targets(ossit.shape[0], input_gap=1, input_length=24, pred_shift=24, pred_length=24, samples_gap=samples_gap)
-            uv.append(ossit[idx_uv])
+            self.indices = prepare_inputs_targets(ossit.shape[0], input_gap=1, input_length=24, pred_shift=24, pred_length=24,
+                                                  samples_gap=samples_gap)
+            uv.append(ossit[self.indices])
 
         self.uv = uv[0]
 
@@ -38,3 +40,9 @@ class data_process(Dataset):
 
     def __getitem__(self, idx):
         return self.uv[idx]
+
+
+def build_power_sequences(power_series: np.ndarray, indices: np.ndarray) -> np.ndarray:
+    """Slice turbine power series using the same temporal indices as the atmospheric data."""
+    assert power_series.ndim == 2, "Power series must be [time, num_turbines]."
+    return power_series[indices]
