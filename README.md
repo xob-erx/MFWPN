@@ -30,6 +30,7 @@ pip install -r requirements.txt
 - `config.py：`  training configs for the MF-WPN.
 - `main.py:` Train the MF-WPN.
 - `test.py` Test the MF-WPN.
+- `docs/mfwpn_structure.md`: high-level structure diagram of the joint wind and turbine power prediction model.
 
 ## Data preparation
 The data used in this study and its processing have been described in detail in the manuscript. To facilitate the testing, we have prepared the [MFWPN weights](https://drive.google.com/file/d/1YrJP1sCWUcsHcYdNL_sWFbkuS4WfaeJf/view?usp=sharing) , [test dataset](https://drive.google.com/drive/folders/1qQMV8xBRDI5Vg9pxigLAJNEOtNC4O87x?usp=sharing) and [train_val_dataset](https://drive.google.com/drive/folders/1ppxlPq2PABTpUfXTWfQZ3ZDCXvmXfuqk?usp=sharing).
