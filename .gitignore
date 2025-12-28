@@ -1,0 +1,19 @@
+# Python缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 大型数据文件（可选，根据需要取消注释）
+# *.npy
+# *.npz
+
+# 模型检查点
+chkfile/
+
+# 结果文件
+result/
+
+# Jupyter临时文件
+.ipynb_checkpoints/
+
+data/

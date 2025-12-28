@@ -22,12 +22,105 @@ def _validate_turbine_coords(coords: Iterable[Tuple[int, int]], height: int, wid
     return validated
 
 
+class WindCorrectionHead(nn.Module):
+    """校正插值风速，预测精确位置的真实风速。
+    
+    将双线性插值得到的风速通过 MLP 校正，结合局部特征学习插值误差的修正量。
+    """
+
+    def __init__(self, feature_dim: int, turbine_coords: Sequence[Tuple[int, int]], 
+                 roi_size: int = 5, hidden_dim: int = 64, feature_hw: Tuple[int, int] = (64, 80)):
+        super().__init__()
+        if roi_size % 2 == 0 or roi_size <= 0:
+            raise ValueError(f"roi_size must be a positive odd number, got {roi_size}.")
+
+        self.roi_size = roi_size
+        self.pad = roi_size // 2
+        self.feature_hw = feature_hw
+        self.turbine_coords = _validate_turbine_coords(turbine_coords, *feature_hw)
+        self.num_turbines = len(self.turbine_coords)
+
+        feature_h, feature_w = feature_hw
+        norm_coords = []
+        for h_idx, w_idx in self.turbine_coords:
+            y = 2.0 * h_idx / (feature_h - 1) - 1.0
+            x = 2.0 * w_idx / (feature_w - 1) - 1.0
+            norm_coords.append([x, y])
+        grid = torch.tensor(norm_coords, dtype=torch.float32).view(1, self.num_turbines, 1, 2)
+        self.register_buffer('sample_grid', grid, persistent=False)
+
+        self.local_conv = nn.Sequential(
+            nn.Conv2d(feature_dim, hidden_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+        # 输入：插值风速(1) + 局部特征(hidden_dim)
+        self.correction_mlp = nn.Sequential(
+            nn.Linear(1 + hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+
+    def forward(self, features: torch.Tensor, wind_field: torch.Tensor) -> dict:
+        """计算校正后的精确点风速。
+
+        Args:
+            features: 时空特征 [B, T, C, H, W]
+            wind_field: 预测风场 (u, v) [B, T, 2, H, W]
+
+        Returns:
+            dict: {
+                'interp_speed': 插值风速 [B, T, N_turbines],
+                'corrected_speed': 校正后风速 [B, T, N_turbines]
+            }
+        """
+        b, t, c, h, w = features.shape
+
+        # 计算风速场并插值到精确点
+        wind_speed = torch.linalg.norm(wind_field, dim=2, keepdim=True)  # [B, T, 1, H, W]
+        wind_speed_flat = wind_speed.reshape(b * t, 1, h, w)
+        grid = self.sample_grid.to(wind_speed_flat.device)
+        sampled = F.grid_sample(wind_speed_flat, grid.expand(b * t, -1, -1, -1),
+                                align_corners=True, mode='bilinear')
+        interp_speed = sampled.view(b, t, self.num_turbines)  # [B, T, N]
+
+        # 提取每个精确点的局部特征
+        x = features.reshape(b * t, c, h, w)
+        x = F.pad(x, (self.pad, self.pad, self.pad, self.pad), mode='replicate')
+
+        corrected_outputs = []
+        for idx, (h_idx, w_idx) in enumerate(self.turbine_coords):
+            center_h = h_idx + self.pad
+            center_w = w_idx + self.pad
+            patch = x[:, :, center_h - self.pad:center_h + self.pad + 1,
+                      center_w - self.pad:center_w + self.pad + 1]
+            local_feat = self.local_conv(patch)
+            pooled = self.pool(local_feat).reshape(b, t, -1)  # [B, T, hidden_dim]
+
+            # 拼接插值风速和局部特征
+            point_interp = interp_speed[:, :, idx:idx + 1]  # [B, T, 1]
+            mlp_input = torch.cat([point_interp, pooled], dim=-1)  # [B, T, 1+hidden_dim]
+            corrected = self.correction_mlp(mlp_input.reshape(b * t, -1)).reshape(b, t, 1)
+            corrected_outputs.append(corrected)
+
+        corrected_speed = torch.cat(corrected_outputs, dim=2)  # [B, T, N]
+
+        return {
+            'interp_speed': interp_speed,
+            'corrected_speed': corrected_speed
+        }
+
+
 class TurbinePowerHead(nn.Module):
     """Predict turbine power from shared spatiotemporal features."""
 
     def __init__(self, in_channels: int, turbine_coords: Sequence[Tuple[int, int]], roi_size: int = 5,
                  conv_channels: int = 32, mlp_hidden_dim: int = 64, feature_hw: Tuple[int, int] = (64, 80),
-                 include_wind_speed: bool = True):
+                 include_wind_speed: bool = True, use_corrected_speed: bool = False):
         super().__init__()
         if roi_size % 2 == 0 or roi_size <= 0:
             raise ValueError(f"roi_size must be a positive odd number, got {roi_size}.")
@@ -38,6 +131,7 @@ class TurbinePowerHead(nn.Module):
         self.turbine_coords = _validate_turbine_coords(turbine_coords, *feature_hw)
         self.num_turbines = len(self.turbine_coords)
         self.include_wind_speed = include_wind_speed
+        self.use_corrected_speed = use_corrected_speed
 
         conv_hidden = max(conv_channels, in_channels)
         self.local_conv = nn.Sequential(
@@ -70,12 +164,15 @@ class TurbinePowerHead(nn.Module):
         else:
             self.register_buffer('sample_grid', None, persistent=False)
 
-    def forward(self, features: torch.Tensor, wind_field: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, features: torch.Tensor, wind_field: Optional[torch.Tensor] = None,
+                corrected_speed: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Compute power predictions.
 
         Args:
             features: Tensor of shape [B, T, C, H, W].
             wind_field: Optional tensor of predicted wind vectors shaped [B, T, 2, H, W].
+            corrected_speed: Optional tensor of corrected wind speed [B, T, N_turbines].
+                             If use_corrected_speed=True, this will be used instead of interpolated speed.
 
         Returns:
             Power predictions shaped [B, T, N_turbines, 1].
@@ -99,11 +196,15 @@ class TurbinePowerHead(nn.Module):
                                     align_corners=True, mode='bilinear')
             sampled_speed = sampled.view(b, t, self.num_turbines)
 
+        # 如果启用校正风速且提供了校正值，则使用校正后的风速
+        if self.use_corrected_speed and corrected_speed is not None:
+            sampled_speed = corrected_speed
+
         x = features.reshape(b * t, c, h, w)
         x = F.pad(x, (self.pad, self.pad, self.pad, self.pad), mode='replicate')
 
         power_outputs = []
-        for h_idx, w_idx in self.turbine_coords:
+        for idx, (h_idx, w_idx) in enumerate(self.turbine_coords):
             center_h = h_idx + self.pad
             center_w = w_idx + self.pad
             patch = x[:, :, center_h - self.pad:center_h + self.pad + 1,
@@ -125,7 +226,9 @@ class MFWPN_Model(nn.Module):
                  mlp_ratio=8., drop=0.0, drop_path=0.0, spatio_kernel_enc=3,
                  spatio_kernel_dec=3, act_inplace=True, turbine_coords: Optional[Sequence[Tuple[int, int]]] = None,
                  power_roi_size: int = 5, power_conv_channels: int = 32, power_mlp_hidden: int = 64,
-                 feature_hw: Tuple[int, int] = (64, 80), **kwargs):
+                 feature_hw: Tuple[int, int] = (64, 80), 
+                 enable_wind_correction: bool = False, wind_correction_hidden: int = 64,
+                 use_corrected_speed_for_power: bool = False, **kwargs):
         super(MFWPN_Model, self).__init__()
         T, C, H, W = 24, 2, 64, 80  # T is pre_seq_length
         act_inplace = False
@@ -141,15 +244,30 @@ class MFWPN_Model(nn.Module):
         self.ele_conv = nn.Sequential(
             nn.Conv2d(48, 48, kernel_size=3, stride=1, padding=1),
             nn.Conv2d(48, 48, kernel_size=1, stride=1))
+        self.wind_correction_head: Optional[WindCorrectionHead] = None
         self.power_head: Optional[TurbinePowerHead] = None
+        self._turbine_coords = turbine_coords
+        self._feature_hw = feature_hw
+        
         if turbine_coords:
+            # 精确点风速校正头
+            if enable_wind_correction:
+                self.wind_correction_head = WindCorrectionHead(
+                    feature_dim=hid_S,
+                    turbine_coords=turbine_coords,
+                    roi_size=power_roi_size,
+                    hidden_dim=wind_correction_hidden,
+                    feature_hw=feature_hw
+                )
+            # 功率预测头
             self.power_head = TurbinePowerHead(
                 in_channels=hid_S,
                 turbine_coords=turbine_coords,
                 roi_size=power_roi_size,
                 conv_channels=power_conv_channels,
                 mlp_hidden_dim=power_mlp_hidden,
-                feature_hw=feature_hw
+                feature_hw=feature_hw,
+                use_corrected_speed=use_corrected_speed_for_power
             )
 
     def forward(self, x_raw, ele, **kwargs):
@@ -179,9 +297,18 @@ class MFWPN_Model(nn.Module):
         Y = Y.reshape(B, T, 2, H, W)
 
         outputs = {'wind': Y}
+        
+        corrected_speed = None
+        if self.wind_correction_head is not None:
+            wind_corr_out = self.wind_correction_head(hid_w, wind_field=Y)
+            outputs['interp_speed'] = wind_corr_out['interp_speed']
+            outputs['corrected_speed'] = wind_corr_out['corrected_speed']
+            corrected_speed = wind_corr_out['corrected_speed']
+        
         if self.power_head is not None:
-            power_pred = self.power_head(hid_w, wind_field=Y)
+            power_pred = self.power_head(hid_w, wind_field=Y, corrected_speed=corrected_speed)
             outputs['power'] = power_pred
+        
         return outputs
     
 class SAM(nn.Module):
