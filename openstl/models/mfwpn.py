@@ -23,24 +23,76 @@ def _validate_turbine_coords(coords: Iterable[Tuple[int, int]], height: int, wid
 
 
 class WindCorrectionHead(nn.Module):
-    """校正插值风速，预测精确位置的真实风速。
+    """增强版风速校正头：残差学习 + 丰富输入特征
     
-    将双线性插值得到的风速通过 MLP 校正，结合局部特征学习插值误差的修正量。
+    改进点:
+    1. 残差学习: MLP只学习修正量Δv，最终输出 = 插值风速 + Δv
+    2. 增强输入: 添加u/v分量、风速梯度、邻域信息
+    3. 更深网络: 增加层数 + LayerNorm + Dropout
     """
 
     def __init__(self, feature_dim: int, turbine_coords: Sequence[Tuple[int, int]], 
-                 roi_size: int = 5, hidden_dim: int = 64, feature_hw: Tuple[int, int] = (64, 80)):
+                 roi_size: int = 5, hidden_dim: int = 128, feature_hw: Tuple[int, int] = (64, 80),
+                 use_residual: bool = True, dropout: float = 0.1):
         super().__init__()
         if roi_size % 2 == 0 or roi_size <= 0:
             raise ValueError(f"roi_size must be a positive odd number, got {roi_size}.")
 
+        self.use_residual = use_residual
         self.roi_size = roi_size
         self.pad = roi_size // 2
         self.feature_hw = feature_hw
         self.turbine_coords = _validate_turbine_coords(turbine_coords, *feature_hw)
         self.num_turbines = len(self.turbine_coords)
+        self.hidden_dim = hidden_dim
 
-        feature_h, feature_w = feature_hw
+        # 初始化采样网格
+        self._init_sample_grids()
+
+        # 局部特征提取
+        local_feat_dim = hidden_dim // 2
+        self.local_conv = nn.Sequential(
+            nn.Conv2d(feature_dim, local_feat_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(local_feat_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+        # 增强输入维度:
+        # - 插值风速: 1
+        # - u, v 分量: 2
+        # - 风速梯度 (上下左右): 4
+        # - 3x3邻域 (去中心): 8
+        # - 局部特征: local_feat_dim
+        enhanced_input_dim = 1 + 2 + 4 + 8 + local_feat_dim
+
+        # 深层 MLP with 正则化
+        self.correction_mlp = nn.Sequential(
+            nn.Linear(enhanced_input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            
+            nn.Linear(hidden_dim // 2, 1)
+        )
+
+        # 残差缩放因子 (可学习)
+        if use_residual:
+            self.residual_scale = nn.Parameter(torch.ones(1) * 0.1)
+
+    def _init_sample_grids(self):
+        """初始化采样网格: 中心点 + 3x3邻域"""
+        feature_h, feature_w = self.feature_hw
+        
+        # 中心点采样网格
         norm_coords = []
         for h_idx, w_idx in self.turbine_coords:
             y = 2.0 * h_idx / (feature_h - 1) - 1.0
@@ -48,22 +100,39 @@ class WindCorrectionHead(nn.Module):
             norm_coords.append([x, y])
         grid = torch.tensor(norm_coords, dtype=torch.float32).view(1, self.num_turbines, 1, 2)
         self.register_buffer('sample_grid', grid, persistent=False)
+        
+        # 3x3 邻域采样网格 (去掉中心点)
+        neighbor_coords = []
+        for h_idx, w_idx in self.turbine_coords:
+            for dh in [-1, 0, 1]:
+                for dw in [-1, 0, 1]:
+                    if dh == 0 and dw == 0:
+                        continue  # 跳过中心点
+                    nh = max(0, min(h_idx + dh, feature_h - 1))
+                    nw = max(0, min(w_idx + dw, feature_w - 1))
+                    y = 2.0 * nh / (feature_h - 1) - 1.0
+                    x = 2.0 * nw / (feature_w - 1) - 1.0
+                    neighbor_coords.append([x, y])
+        neighbor_grid = torch.tensor(neighbor_coords, dtype=torch.float32)
+        neighbor_grid = neighbor_grid.view(1, self.num_turbines * 8, 1, 2)
+        self.register_buffer('neighbor_grid', neighbor_grid, persistent=False)
 
-        self.local_conv = nn.Sequential(
-            nn.Conv2d(feature_dim, hidden_dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(hidden_dim),
-            nn.ReLU(inplace=True),
-        )
-        self.pool = nn.AdaptiveAvgPool2d(1)
-
-        # 输入：插值风速(1) + 局部特征(hidden_dim)
-        self.correction_mlp = nn.Sequential(
-            nn.Linear(1 + hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim // 2, 1)
-        )
+    def _compute_gradients(self, speed_field: torch.Tensor, h_idx: int, w_idx: int) -> torch.Tensor:
+        """计算指定位置的风速梯度"""
+        b, t, _, h, w = speed_field.shape
+        
+        def safe_get(hi, wi):
+            hi = max(0, min(hi, h-1))
+            wi = max(0, min(wi, w-1))
+            return speed_field[:, :, 0, hi, wi]
+        
+        center = safe_get(h_idx, w_idx)
+        grad_up = center - safe_get(h_idx - 1, w_idx)
+        grad_down = safe_get(h_idx + 1, w_idx) - center
+        grad_left = center - safe_get(h_idx, w_idx - 1)
+        grad_right = safe_get(h_idx, w_idx + 1) - center
+        
+        return torch.stack([grad_up, grad_down, grad_left, grad_right], dim=-1)
 
     def forward(self, features: torch.Tensor, wind_field: torch.Tensor) -> dict:
         """计算校正后的精确点风速。
@@ -79,38 +148,290 @@ class WindCorrectionHead(nn.Module):
             }
         """
         b, t, c, h, w = features.shape
+        device = features.device
 
-        # 计算风速场并插值到精确点
-        wind_speed = torch.linalg.norm(wind_field, dim=2, keepdim=True)  # [B, T, 1, H, W]
-        wind_speed_flat = wind_speed.reshape(b * t, 1, h, w)
-        grid = self.sample_grid.to(wind_speed_flat.device)
-        sampled = F.grid_sample(wind_speed_flat, grid.expand(b * t, -1, -1, -1),
-                                align_corners=True, mode='bilinear')
-        interp_speed = sampled.view(b, t, self.num_turbines)  # [B, T, N]
-
-        # 提取每个精确点的局部特征
+        # 1. 计算风速场
+        speed_field = torch.linalg.norm(wind_field, dim=2, keepdim=True)  # [B,T,1,H,W]
+        
+        # 2. 插值 u, v, speed
+        wind_flat = wind_field.reshape(b * t, 2, h, w)
+        speed_flat = speed_field.reshape(b * t, 1, h, w)
+        grid = self.sample_grid.to(device).expand(b * t, -1, -1, -1)
+        
+        u_interp = F.grid_sample(wind_flat[:, 0:1], grid, align_corners=True, mode='bilinear')
+        v_interp = F.grid_sample(wind_flat[:, 1:2], grid, align_corners=True, mode='bilinear')
+        speed_interp = F.grid_sample(speed_flat, grid, align_corners=True, mode='bilinear')
+        
+        u_interp = u_interp.view(b, t, self.num_turbines)
+        v_interp = v_interp.view(b, t, self.num_turbines)
+        speed_interp = speed_interp.view(b, t, self.num_turbines)
+        
+        # 3. 采样邻域风速
+        neighbor_grid = self.neighbor_grid.to(device).expand(b * t, -1, -1, -1)
+        neighbors = F.grid_sample(speed_flat, neighbor_grid, align_corners=True, mode='bilinear')
+        neighbors = neighbors.view(b, t, self.num_turbines, 8)
+        
+        # 4. 提取局部特征
         x = features.reshape(b * t, c, h, w)
         x = F.pad(x, (self.pad, self.pad, self.pad, self.pad), mode='replicate')
-
+        
         corrected_outputs = []
         for idx, (h_idx, w_idx) in enumerate(self.turbine_coords):
+            # 局部特征
             center_h = h_idx + self.pad
             center_w = w_idx + self.pad
             patch = x[:, :, center_h - self.pad:center_h + self.pad + 1,
                       center_w - self.pad:center_w + self.pad + 1]
             local_feat = self.local_conv(patch)
-            pooled = self.pool(local_feat).reshape(b, t, -1)  # [B, T, hidden_dim]
-
-            # 拼接插值风速和局部特征
-            point_interp = interp_speed[:, :, idx:idx + 1]  # [B, T, 1]
-            mlp_input = torch.cat([point_interp, pooled], dim=-1)  # [B, T, 1+hidden_dim]
-            corrected = self.correction_mlp(mlp_input.reshape(b * t, -1)).reshape(b, t, 1)
+            pooled = self.pool(local_feat).reshape(b, t, -1)
+            
+            # 计算梯度
+            gradients = self._compute_gradients(speed_field, h_idx, w_idx)
+            
+            # 组合特征
+            point_features = torch.cat([
+                speed_interp[:, :, idx:idx+1],     # 插值风速 (1)
+                u_interp[:, :, idx:idx+1],         # u 分量 (1)
+                v_interp[:, :, idx:idx+1],         # v 分量 (1)
+                gradients,                          # 梯度 (4)
+                neighbors[:, :, idx, :],           # 邻域 (8)
+                pooled                              # 局部特征 (hidden_dim//2)
+            ], dim=-1)
+            
+            # MLP 校正
+            delta = self.correction_mlp(point_features.reshape(b * t, -1))
+            delta = delta.reshape(b, t, 1)
+            
+            # 残差输出
+            if self.use_residual:
+                corrected = speed_interp[:, :, idx:idx+1] + self.residual_scale * delta
+            else:
+                corrected = delta
+            
             corrected_outputs.append(corrected)
+        
+        corrected_speed = torch.cat(corrected_outputs, dim=2)
 
+        return {
+            'interp_speed': speed_interp,
+            'corrected_speed': corrected_speed
+        }
+
+
+class TemporalWindCorrectionHead(nn.Module):
+    """时序风速校正头：使用双向LSTM建模时间依赖
+    
+    改进点:
+    1. 双向LSTM: 同时利用过去和未来的时序信息
+    2. 时间嵌入: 编码小时信息，学习日周期模式
+    3. 残差学习: 保持残差输出结构
+    4. 增强输入: 保留u/v分量、梯度、邻域特征
+    """
+
+    def __init__(self, feature_dim: int, turbine_coords: Sequence[Tuple[int, int]], 
+                 roi_size: int = 5, hidden_dim: int = 128, 
+                 lstm_hidden: int = 128, lstm_layers: int = 2,
+                 dropout: float = 0.2, bidirectional: bool = True,
+                 use_time_embedding: bool = True,
+                 feature_hw: Tuple[int, int] = (64, 80)):
+        super().__init__()
+        
+        self.roi_size = roi_size
+        self.pad = roi_size // 2
+        self.feature_hw = feature_hw
+        self.turbine_coords = _validate_turbine_coords(turbine_coords, *feature_hw)
+        self.num_turbines = len(self.turbine_coords)
+        self.use_time_embedding = use_time_embedding
+        self.bidirectional = bidirectional
+
+        # 初始化采样网格
+        self._init_sample_grids()
+
+        # 局部特征提取
+        local_feat_dim = hidden_dim // 2
+        self.local_conv = nn.Sequential(
+            nn.Conv2d(feature_dim, local_feat_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(local_feat_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+        # 增强输入维度: speed(1) + u,v(2) + grad(4) + neighbors(8) + local_feat
+        enhanced_input_dim = 1 + 2 + 4 + 8 + local_feat_dim
+
+        # 输入投影层
+        self.input_proj = nn.Sequential(
+            nn.Linear(enhanced_input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+
+        # 时间嵌入 (24小时)
+        if use_time_embedding:
+            self.hour_embedding = nn.Embedding(24, hidden_dim // 4)
+            lstm_input_dim = hidden_dim + hidden_dim // 4
+        else:
+            lstm_input_dim = hidden_dim
+
+        # 双向 LSTM
+        self.lstm = nn.LSTM(
+            input_size=lstm_input_dim,
+            hidden_size=lstm_hidden,
+            num_layers=lstm_layers,
+            batch_first=True,
+            dropout=dropout if lstm_layers > 1 else 0,
+            bidirectional=bidirectional
+        )
+
+        # 输出层
+        lstm_output_dim = lstm_hidden * (2 if bidirectional else 1)
+        self.output_head = nn.Sequential(
+            nn.Linear(lstm_output_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+
+        # 残差缩放因子 (可学习)
+        self.residual_scale = nn.Parameter(torch.ones(1) * 0.1)
+
+    def _init_sample_grids(self):
+        """初始化采样网格: 中心点 + 3x3邻域"""
+        feature_h, feature_w = self.feature_hw
+        
+        # 中心点采样网格
+        norm_coords = []
+        for h_idx, w_idx in self.turbine_coords:
+            y = 2.0 * h_idx / (feature_h - 1) - 1.0
+            x = 2.0 * w_idx / (feature_w - 1) - 1.0
+            norm_coords.append([x, y])
+        grid = torch.tensor(norm_coords, dtype=torch.float32).view(1, self.num_turbines, 1, 2)
+        self.register_buffer('sample_grid', grid, persistent=False)
+        
+        # 3x3 邻域采样网格 (去掉中心点)
+        neighbor_coords = []
+        for h_idx, w_idx in self.turbine_coords:
+            for dh in [-1, 0, 1]:
+                for dw in [-1, 0, 1]:
+                    if dh == 0 and dw == 0:
+                        continue
+                    nh = max(0, min(h_idx + dh, feature_h - 1))
+                    nw = max(0, min(w_idx + dw, feature_w - 1))
+                    y = 2.0 * nh / (feature_h - 1) - 1.0
+                    x = 2.0 * nw / (feature_w - 1) - 1.0
+                    neighbor_coords.append([x, y])
+        neighbor_grid = torch.tensor(neighbor_coords, dtype=torch.float32)
+        neighbor_grid = neighbor_grid.view(1, self.num_turbines * 8, 1, 2)
+        self.register_buffer('neighbor_grid', neighbor_grid, persistent=False)
+
+    def _compute_gradients(self, speed_field: torch.Tensor, h_idx: int, w_idx: int) -> torch.Tensor:
+        """计算指定位置的风速梯度"""
+        b, t, _, h, w = speed_field.shape
+        
+        def safe_get(hi, wi):
+            hi = max(0, min(hi, h-1))
+            wi = max(0, min(wi, w-1))
+            return speed_field[:, :, 0, hi, wi]
+        
+        center = safe_get(h_idx, w_idx)
+        grad_up = center - safe_get(h_idx - 1, w_idx)
+        grad_down = safe_get(h_idx + 1, w_idx) - center
+        grad_left = center - safe_get(h_idx, w_idx - 1)
+        grad_right = safe_get(h_idx, w_idx + 1) - center
+        
+        return torch.stack([grad_up, grad_down, grad_left, grad_right], dim=-1)
+
+    def forward(self, features: torch.Tensor, wind_field: torch.Tensor) -> dict:
+        """计算校正后的精确点风速（时序版本）
+
+        Args:
+            features: 时空特征 [B, T, C, H, W]
+            wind_field: 预测风场 (u, v) [B, T, 2, H, W]
+
+        Returns:
+            dict: {
+                'interp_speed': 插值风速 [B, T, N_turbines],
+                'corrected_speed': 校正后风速 [B, T, N_turbines]
+            }
+        """
+        b, t, c, h, w = features.shape
+        device = features.device
+
+        # 1. 计算风速场
+        speed_field = torch.linalg.norm(wind_field, dim=2, keepdim=True)  # [B,T,1,H,W]
+        
+        # 2. 插值 u, v, speed
+        wind_flat = wind_field.reshape(b * t, 2, h, w)
+        speed_flat = speed_field.reshape(b * t, 1, h, w)
+        grid = self.sample_grid.to(device).expand(b * t, -1, -1, -1)
+        
+        u_interp = F.grid_sample(wind_flat[:, 0:1], grid, align_corners=True, mode='bilinear')
+        v_interp = F.grid_sample(wind_flat[:, 1:2], grid, align_corners=True, mode='bilinear')
+        speed_interp = F.grid_sample(speed_flat, grid, align_corners=True, mode='bilinear')
+        
+        u_interp = u_interp.view(b, t, self.num_turbines)
+        v_interp = v_interp.view(b, t, self.num_turbines)
+        speed_interp = speed_interp.view(b, t, self.num_turbines)
+        
+        # 3. 采样邻域风速
+        neighbor_grid = self.neighbor_grid.to(device).expand(b * t, -1, -1, -1)
+        neighbors = F.grid_sample(speed_flat, neighbor_grid, align_corners=True, mode='bilinear')
+        neighbors = neighbors.view(b, t, self.num_turbines, 8)
+        
+        # 4. 提取局部特征
+        x = features.reshape(b * t, c, h, w)
+        x = F.pad(x, (self.pad, self.pad, self.pad, self.pad), mode='replicate')
+        
+        corrected_outputs = []
+        for idx, (h_idx, w_idx) in enumerate(self.turbine_coords):
+            # 局部特征
+            center_h = h_idx + self.pad
+            center_w = w_idx + self.pad
+            patch = x[:, :, center_h - self.pad:center_h + self.pad + 1,
+                      center_w - self.pad:center_w + self.pad + 1]
+            local_feat = self.local_conv(patch)
+            pooled = self.pool(local_feat).reshape(b, t, -1)
+            
+            # 计算梯度
+            gradients = self._compute_gradients(speed_field, h_idx, w_idx)
+            
+            # 组合特征 [B, T, D]
+            point_features = torch.cat([
+                speed_interp[:, :, idx:idx+1],     # 插值风速 (1)
+                u_interp[:, :, idx:idx+1],         # u 分量 (1)
+                v_interp[:, :, idx:idx+1],         # v 分量 (1)
+                gradients,                          # 梯度 (4)
+                neighbors[:, :, idx, :],           # 邻域 (8)
+                pooled                              # 局部特征 (hidden_dim//2)
+            ], dim=-1)
+            
+            # 5. 输入投影
+            proj_feat = self.input_proj(point_features)  # [B, T, hidden_dim]
+            
+            # 6. 添加时间嵌入
+            if self.use_time_embedding:
+                hours = torch.arange(t, device=device)
+                hour_emb = self.hour_embedding(hours)  # [T, hidden_dim//4]
+                hour_emb = hour_emb.unsqueeze(0).expand(b, -1, -1)  # [B, T, hidden_dim//4]
+                lstm_input = torch.cat([proj_feat, hour_emb], dim=-1)
+            else:
+                lstm_input = proj_feat
+            
+            # 7. LSTM 时序建模
+            lstm_out, _ = self.lstm(lstm_input)  # [B, T, lstm_hidden*2]
+            
+            # 8. 输出修正量
+            delta = self.output_head(lstm_out)  # [B, T, 1]
+            
+            # 9. 残差输出
+            corrected = speed_interp[:, :, idx:idx+1] + self.residual_scale * delta
+            corrected_outputs.append(corrected)
+        
         corrected_speed = torch.cat(corrected_outputs, dim=2)  # [B, T, N]
 
         return {
-            'interp_speed': interp_speed,
+            'interp_speed': speed_interp,
             'corrected_speed': corrected_speed
         }
 
@@ -227,7 +548,11 @@ class MFWPN_Model(nn.Module):
                  spatio_kernel_dec=3, act_inplace=True, turbine_coords: Optional[Sequence[Tuple[int, int]]] = None,
                  power_roi_size: int = 5, power_conv_channels: int = 32, power_mlp_hidden: int = 64,
                  feature_hw: Tuple[int, int] = (64, 80), 
-                 enable_wind_correction: bool = False, wind_correction_hidden: int = 64,
+                 enable_wind_correction: bool = False, wind_correction_hidden: int = 128,
+                 wind_correction_dropout: float = 0.1, use_residual: bool = True,
+                 use_temporal_correction: bool = False,  # 使用时序LSTM校正头
+                 lstm_hidden: int = 128, lstm_layers: int = 2,
+                 use_time_embedding: bool = True,
                  use_corrected_speed_for_power: bool = False, **kwargs):
         super(MFWPN_Model, self).__init__()
         T, C, H, W = 24, 2, 64, 80  # T is pre_seq_length
@@ -252,13 +577,31 @@ class MFWPN_Model(nn.Module):
         if turbine_coords:
             # 精确点风速校正头
             if enable_wind_correction:
-                self.wind_correction_head = WindCorrectionHead(
-                    feature_dim=hid_S,
-                    turbine_coords=turbine_coords,
-                    roi_size=power_roi_size,
-                    hidden_dim=wind_correction_hidden,
-                    feature_hw=feature_hw
-                )
+                if use_temporal_correction:
+                    # 时序 LSTM 版本
+                    self.wind_correction_head = TemporalWindCorrectionHead(
+                        feature_dim=hid_S,
+                        turbine_coords=turbine_coords,
+                        roi_size=power_roi_size,
+                        hidden_dim=wind_correction_hidden,
+                        lstm_hidden=lstm_hidden,
+                        lstm_layers=lstm_layers,
+                        dropout=wind_correction_dropout,
+                        bidirectional=True,
+                        use_time_embedding=use_time_embedding,
+                        feature_hw=feature_hw
+                    )
+                else:
+                    # MLP 版本
+                    self.wind_correction_head = WindCorrectionHead(
+                        feature_dim=hid_S,
+                        turbine_coords=turbine_coords,
+                        roi_size=power_roi_size,
+                        hidden_dim=wind_correction_hidden,
+                        feature_hw=feature_hw,
+                        use_residual=use_residual,
+                        dropout=wind_correction_dropout
+                    )
             # 功率预测头
             self.power_head = TurbinePowerHead(
                 in_channels=hid_S,

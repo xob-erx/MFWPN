@@ -248,11 +248,16 @@ class Stage2Trainer:
         self.configs = configs
         self.device = configs.device
         
-        # 初始化模型（启用风速校正）
+        # 初始化模型（启用时序LSTM风速校正）
         self.model = MFWPN_Model(
             turbine_coords=[turbine_coord],
             enable_wind_correction=True,
-            wind_correction_hidden=64,
+            use_temporal_correction=True,    # 使用时序LSTM
+            wind_correction_hidden=128,      # 隐藏层维度
+            lstm_hidden=128,                 # LSTM隐藏层
+            lstm_layers=2,                   # LSTM层数
+            wind_correction_dropout=0.2,     # Dropout
+            use_time_embedding=True,         # 时间嵌入
             use_corrected_speed_for_power=True,
             power_roi_size=5,
             power_conv_channels=32,
