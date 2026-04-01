@@ -33,3 +33,10 @@ configs.power_loss_weight = 1.0
 configs.power_data_path = None
 configs.power_test_data_path = None
 configs.feature_hw = (64, 80)
+
+configs.stage1_uv_train_path = 'data/Northeast/uv100_train.npy'
+configs.stage1_zt_train_path = 'data/Northeast/1000zt_train.npy'
+configs.stage1_dem_path = 'data/Northeast/DEM_northeast.npy'
+configs.stage1_checkpoint_path = 'chkfile/checkpoint_mfwpn.chk'
+configs.stage1_train_config_dump_path = 'config_train.pkl'
+configs.stage1_samples_gap = 3

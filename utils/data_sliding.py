@@ -1,6 +1,5 @@
 import numpy as np
 from torch.utils.data import Dataset
-import xarray as xr
 from pathlib import Path
 import torch
 

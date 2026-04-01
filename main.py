@@ -1,29 +1,14 @@
 import os
 import torch
-from copy import deepcopy
 import numpy as np
-import xarray as xr
-import pandas as pd
 import torch.nn as nn
-import random
-from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
-import zipfile
-import torchvision.models as models
 from openstl.models.mfwpn import MFWPN_Model
-import torch
-import torch.nn as nn
 from config import configs
-from torch.utils.data import DataLoader
 import pickle
 import math
-from matplotlib.pyplot import MultipleLocator
 from utils.data_sliding import *
-import pywt
-import pywt.data
-import torch.nn.functional as F
 from utils import SSIM
-from thop import profile
 from sklearn.model_selection import train_test_split
 
 class NoamOpt:
@@ -325,19 +310,31 @@ class dataset_package(Dataset):
 if __name__ == '__main__':
     print('Configs:\n', configs.__dict__)
 
-    uv_train = np.load("data/Northeast/uv100_train.npy").astype(np.float32)
-    zt_train = np.load("data/Northeast/1000zt_train.npy").astype(np.float32)
+    uv_train_path = configs.stage1_uv_train_path
+    zt_train_path = configs.stage1_zt_train_path
+    dem_path = configs.stage1_dem_path
+    checkpoint_path = configs.stage1_checkpoint_path
+    config_dump_path = configs.stage1_train_config_dump_path
+    samples_gap = configs.stage1_samples_gap
+
+    for data_path in [uv_train_path, zt_train_path, dem_path]:
+        if not os.path.exists(data_path):
+            raise FileNotFoundError(f'Stage1 data file not found: {data_path}')
+
+    uv_train = np.load(uv_train_path).astype(np.float32)
+    zt_train = np.load(zt_train_path).astype(np.float32)
     
     uv_train = np.concatenate((uv_train, zt_train), axis=1)
     del zt_train
     
-    ele = np.load('data/Northeast/DEM_northeast.npy').astype(np.float32)
+    ele = np.load(dem_path).astype(np.float32)
 
     ele[ele < 0] = 0
     ele= (ele - ele.mean()) / ele.std()
 
+    print(f'Loading stage1 data: uv={uv_train_path}, zt={zt_train_path}, dem={dem_path}')
     print('processing training set')
-    uv_windows = data_process(uv_train, samples_gap=3)
+    uv_windows = data_process(uv_train, samples_gap=samples_gap)
     del uv_train
 
     indices = uv_windows.indices
@@ -367,9 +364,6 @@ if __name__ == '__main__':
     print('Dataset_val Shape:\n', dataset_val.GetDataShape())
     
     trainer = Trainer(configs)
-    trainer.save_configs('config_train.pkl')
+    trainer.save_configs(config_dump_path)
     
-    trainer.train(dataset_train, dataset_val, ele, 'chkfile/checkpoint_mfwpn.chk')
-
-
-
+    trainer.train(dataset_train, dataset_val, ele, checkpoint_path)
