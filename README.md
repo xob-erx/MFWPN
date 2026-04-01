@@ -35,10 +35,22 @@ pip install -r requirements.txt
 ## Data preparation
 The data used in this study and its processing have been described in detail in the manuscript. To facilitate the testing, we have prepared the [MFWPN weights](https://drive.google.com/file/d/1YrJP1sCWUcsHcYdNL_sWFbkuS4WfaeJf/view?usp=sharing) , [test dataset](https://drive.google.com/drive/folders/1qQMV8xBRDI5Vg9pxigLAJNEOtNC4O87x?usp=sharing) and [train_val_dataset](https://drive.google.com/drive/folders/1ppxlPq2PABTpUfXTWfQZ3ZDCXvmXfuqk?usp=sharing).
 
+If you have raw GRIB files (e.g. in `data/2020-2025`), generate stage1/stage2 grid npy files with:
+```
+python scripts/process_grib_data.py --data-dir data/2020-2025 --output-dir data/Northeast --train-end "2024-12-31T23:00:00" --drop-lat 38.0 --drop-lon 136.0
+```
+
 ## Train
-After the data is ready, use the following commands to start training the model:
+After the data is ready, use the following commands to start training.
+
+### Stage 1 (grid wind field pretraining)
 ```
 python main.py
+```
+
+### Stage 2 (turbine-point wind correction + power prediction)
+```
+python train_stage2.py
 ```
 
 ## Test
