@@ -53,6 +53,71 @@ python main.py
 python train_stage2.py
 ```
 
+#### Stage 2 detailed guide
+
+Stage 2 expects a turbine data directory containing:
+
+- `turbine_wind_speed.npy` with shape `[N_days, 24]`
+- `turbine_dates.npy` with shape `[N_days]`, date format `YYYY-MM-DD`
+- Optional `turbine_power.npy` with shape `[N_days, 24]`
+- Optional `turbine_meta.json` containing `latitude`, `longitude`, and/or `grid_coord`
+
+You can build this format from hourly CSV + farm coordinates CSV using:
+
+```bash
+python scripts/prepare_stage2_turbine_data.py \
+  --wind-csv "/path/to/风速_小时均值.csv" \
+  --coord-csv "/path/to/风电场经纬度.csv" \
+  --plant-name "龙源八虎山" \
+  --output-dir "data/turbine_points/longyuan_bahushan" \
+  --fill-power nan
+```
+
+Run Stage 2 on GPU (recommended environment: `wpn310`):
+
+```bash
+conda run -n wpn310 python train_stage2.py \
+  --turbine-dir data/turbine_points/longyuan_bahushan \
+  --turbine-lat 42.420278 \
+  --turbine-lon 123.126111 \
+  --coord-rounding round \
+  --allow-missing-power \
+  --test-start-date 2025-11-01 \
+  --result-dir result/exp \
+  --device cuda
+```
+
+Use fixed ratio split (recommended for controlled experiments):
+
+```bash
+conda run -n wpn310 python train_stage2.py \
+  --turbine-dir data/turbine_points/longyuan_bahushan \
+  --turbine-lat 42.420278 \
+  --turbine-lon 123.126111 \
+  --coord-rounding round \
+  --allow-missing-power \
+  --split-mode ratio \
+  --train-ratio 0.7 \
+  --val-ratio 0.1 \
+  --test-ratio 0.2 \
+  --ratio-split-strategy chronological \
+  --result-dir result/exp \
+  --device cuda
+```
+
+Notes:
+
+- If power labels are all missing (`NaN`) and `--allow-missing-power` is enabled, Stage 2 automatically falls back to wind-only training for that run.
+- Split options:
+  - `--split-mode date`: split by `--test-start-date` (default behavior)
+  - `--split-mode ratio`: split by `--train-ratio/--val-ratio/--test-ratio`
+  - For time-series tasks, `--ratio-split-strategy chronological` is recommended.
+- Output is organized by baseline directory name:
+  - If `--turbine-dir data/turbine_points/longyuan_bahushan`
+  - Then outputs are saved to `result/exp/longyuan_bahushan/`
+- `--turbine-lat/--turbine-lon` are converted to fractional grid coordinates for bilinear interpolation, while integer grid indices are still used for local ROI extraction.
+- If you want pure wind-only mode regardless of power files, add `--wind-only`.
+
 ## Test
 We provide the test model weights and test dataset, which can be tested using the following commands after downloading:
 ```
