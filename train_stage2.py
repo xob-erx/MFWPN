@@ -83,7 +83,7 @@ def align_grid_with_turbine(
     grid_start_date: str,
     turbine_dates: np.ndarray,
     hours_per_day: int = 24,
-    turbine_timezone_offset: int = 8,  # 精确点数据时区偏移（北京时间=UTC+8）
+    align_hour_offset: int = 0,
     use_test_data: bool = False,
     test_grid_data: np.ndarray = None,
     test_start_date: str = None
@@ -96,7 +96,7 @@ def align_grid_with_turbine(
         grid_start_date: 网格数据起始日期 (e.g., "2020-01-01", UTC)
         turbine_dates: 精确点日期数组 [N_days] (北京时间)
         hours_per_day: 每天小时数
-        turbine_timezone_offset: 精确点数据的时区偏移（北京时间=8）
+        align_hour_offset: 对齐起始小时偏移（单位：小时）
         use_test_data: 是否使用测试集网格数据
         test_grid_data: 测试网格数据
         test_start_date: 测试网格数据起始日期
@@ -118,19 +118,12 @@ def align_grid_with_turbine(
     valid_days = []
     
     for i, date_str in enumerate(turbine_dates):
-        # 精确点日期是北京时间，需要转换为UTC
-        # 北京时间的一天 00:00-23:59 对应 UTC 的前一天 16:00 到当天 15:59
-        # 但为了简化，我们假设精确点数据是日均值，对应UTC当天的数据
         turbine_date = datetime.strptime(str(date_str), "%Y-%m-%d")
-        
-        # 考虑时区：北京时间比UTC早8小时
-        # 北京时间的第N天 00:00 = UTC第N-1天 16:00
-        # 为简化，我们用北京时间日期对应的UTC同一日期（忽略8小时偏移）
-        # 如果需要精确对齐，可以调整 hour_start
+
         days_offset = (turbine_date - grid_start).days
-        
+
         # UTC小时索引
-        hour_start = days_offset * hours_per_day
+        hour_start = days_offset * hours_per_day + align_hour_offset
         hour_end = hour_start + hours_per_day
         
         if hour_start >= 0 and hour_end <= len(full_grid_data):
@@ -193,7 +186,8 @@ def create_sequences(
     power_hourly: np.ndarray = None,
     input_len: int = 24,
     output_len: int = 24,
-    stride: int = 24
+    stride: int = 24,
+    window_start_hour: int = 0,
 ) -> tuple:
     """
     创建输入-输出序列
@@ -209,6 +203,9 @@ def create_sequences(
     Returns:
         grid_input, grid_target, wind_speed, power
     """
+    if not (0 <= window_start_hour < 24):
+        raise ValueError(f'window_start_hour must be in [0, 23], got {window_start_hour}')
+
     n_hours = len(grid_hourly)
     total_len = input_len + output_len
     
@@ -218,8 +215,8 @@ def create_sequences(
     powers = [] if power_hourly is not None else None
     
     # 按天滑动
-    for day_idx in range(len(wind_speed_hourly) - 1):  # -1 因为需要下一天作为目标
-        hour_start = day_idx * 24
+    for day_idx in range(len(wind_speed_hourly) - 1):
+        hour_start = day_idx * 24 + window_start_hour
         
         if hour_start + total_len > n_hours:
             break
@@ -527,6 +524,10 @@ def parse_args():
                         help='Rounding strategy when converting decimal lat/lon to integer grid indices')
     parser.add_argument('--test-start-date', type=str, default='2025-11-01',
                         help='Test split start date (inclusive), format YYYY-MM-DD')
+    parser.add_argument('--align-hour-offset', type=int, default=0,
+                        help='Hour offset for aligning turbine dates to grid timeline (default: 0, can set 8)')
+    parser.add_argument('--window-start-hour', type=int, default=0,
+                        help='Start hour of each 24h training/prediction window after alignment (0-23)')
     parser.add_argument('--split-mode', choices=['date', 'ratio'], default='date',
                         help='Dataset split mode: by date threshold or by ratios')
     parser.add_argument('--train-ratio', type=float, default=0.7,
@@ -729,9 +730,11 @@ def main():
     
     # ========== 3. 时间对齐 ==========
     print("\n[2] Aligning grid data with turbine data...")
+    print(f"  Align hour offset: {args.align_hour_offset}")
     # 合并训练和测试网格数据
     aligned_grid, valid_days = align_grid_with_turbine(
         grid_train, GRID_START_DATE, dates,
+        align_hour_offset=args.align_hour_offset,
         use_test_data=True,
         test_grid_data=grid_test,
         test_start_date="2024-12-31"  # 测试集起始日期
@@ -791,9 +794,11 @@ def main():
     
     # ========== 5. 创建序列 ==========
     print("\n[4] Creating sequences...")
+    print(f"  Window start hour: {args.window_start_hour}")
     grid_input, grid_target, ws_seq, pw_seq = create_sequences(
         aligned_grid, wind_speed_norm, power_norm,
-        input_len=24, output_len=24, stride=24
+        input_len=24, output_len=24, stride=24,
+        window_start_hour=args.window_start_hour,
     )
     print(f"  Grid input: {grid_input.shape}")
     print(f"  Grid target: {grid_target.shape}")

@@ -82,6 +82,8 @@ conda run -n wpn310 python train_stage2.py \
   --turbine-lon 123.126111 \
   --coord-rounding round \
   --allow-missing-power \
+  --align-hour-offset -8 \
+  --window-start-hour 0 \
   --test-start-date 2025-11-01 \
   --result-dir result/exp \
   --device cuda
@@ -101,8 +103,23 @@ conda run -n wpn310 python train_stage2.py \
   --val-ratio 0.1 \
   --test-ratio 0.2 \
   --ratio-split-strategy chronological \
+  --align-hour-offset -8 \
+  --window-start-hour 0 \
   --result-dir result/exp \
   --device cuda
+```
+
+Recommended quick comparison (to find best setup for your site):
+
+```bash
+# A) Baseline (no timezone shift)
+conda run -n wpn310 python train_stage2.py --turbine-dir data/turbine_points/longyuan_bahushan --split-mode ratio --train-ratio 0.7 --val-ratio 0.1 --test-ratio 0.2 --ratio-split-strategy chronological --allow-missing-power --align-hour-offset 0 --window-start-hour 0 --result-dir result/exp --device cuda
+
+# B) UTC->北京时间日对齐（推荐）
+conda run -n wpn310 python train_stage2.py --turbine-dir data/turbine_points/longyuan_bahushan --split-mode ratio --train-ratio 0.7 --val-ratio 0.1 --test-ratio 0.2 --ratio-split-strategy chronological --allow-missing-power --align-hour-offset -8 --window-start-hour 0 --result-dir result/exp --device cuda
+
+# C) 对齐后窗口从08:00开始
+conda run -n wpn310 python train_stage2.py --turbine-dir data/turbine_points/longyuan_bahushan --split-mode ratio --train-ratio 0.7 --val-ratio 0.1 --test-ratio 0.2 --ratio-split-strategy chronological --allow-missing-power --align-hour-offset -8 --window-start-hour 8 --result-dir result/exp --device cuda
 ```
 
 Notes:
@@ -117,6 +134,20 @@ Notes:
   - Then outputs are saved to `result/exp/longyuan_bahushan/`
 - `--turbine-lat/--turbine-lon` are converted to fractional grid coordinates for bilinear interpolation, while integer grid indices are still used for local ROI extraction.
 - If you want pure wind-only mode regardless of power files, add `--wind-only`.
+
+#### Stage 2 参数说明（中文）
+
+- `--align-hour-offset`：**对齐层参数**，用于在 `train_stage2.py` 中将 turbine 日期与网格时间轴进行小时级平移后再取样。
+  - 默认 `0`：不平移（按 GRIB 原始时间轴对齐，通常是 UTC）。
+  - 若 GRIB 是 UTC、turbine 日期按北京时间（UTC+8）统计，通常应设为 `-8`（北京时间 00:00 对应 UTC 前一天 16:00）。
+
+- `--window-start-hour`：**切窗层参数**，用于控制“在已完成对齐的时间轴上”，每个 24 小时训练/预测窗口从几点开始。
+  - 默认 `0`：窗口从 `00:00` 开始。
+  - 设为 `8`：窗口从 `08:00` 开始（窗口长度仍为 24 小时）。
+
+- 两者区别：
+  - `align-hour-offset` 解决的是 **GRIB 与 turbine 的时间轴对齐问题**；
+  - `window-start-hour` 解决的是 **样本切窗起点问题**。
 
 ## Test
 We provide the test model weights and test dataset, which can be tested using the following commands after downloading:
