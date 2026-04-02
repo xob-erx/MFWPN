@@ -7,6 +7,7 @@
 """
 
 import os
+import argparse
 import torch
 import torch.nn as nn
 import numpy as np
@@ -153,7 +154,7 @@ def align_grid_with_turbine(
 class TurbineDataset(Dataset):
     """精确点训练数据集"""
     
-    def __init__(self, grid_input, grid_target, wind_speed, power, indices=None):
+    def __init__(self, grid_input, grid_target, wind_speed, power=None, indices=None):
         """
         Args:
             grid_input: 输入网格数据 [N, T_in, C, H, W]
@@ -172,6 +173,12 @@ class TurbineDataset(Dataset):
         return len(self.grid_input)
     
     def __getitem__(self, idx):
+        if self.power is None:
+            return (
+                self.grid_input[idx],
+                self.grid_target[idx],
+                self.wind_speed[idx]
+            )
         return (
             self.grid_input[idx],
             self.grid_target[idx],
@@ -183,7 +190,7 @@ class TurbineDataset(Dataset):
 def create_sequences(
     grid_hourly: np.ndarray,
     wind_speed_hourly: np.ndarray,
-    power_hourly: np.ndarray,
+    power_hourly: np.ndarray = None,
     input_len: int = 24,
     output_len: int = 24,
     stride: int = 24
@@ -208,7 +215,7 @@ def create_sequences(
     grid_inputs = []
     grid_targets = []
     wind_speeds = []
-    powers = []
+    powers = [] if power_hourly is not None else None
     
     # 按天滑动
     for day_idx in range(len(wind_speed_hourly) - 1):  # -1 因为需要下一天作为目标
@@ -224,18 +231,19 @@ def create_sequences(
         
         # 精确点目标: 下一天
         ws = wind_speed_hourly[day_idx + 1]
-        pw = power_hourly[day_idx + 1]
+        pw = power_hourly[day_idx + 1] if power_hourly is not None else None
         
         grid_inputs.append(grid_in)
         grid_targets.append(grid_out)
         wind_speeds.append(ws)
-        powers.append(pw)
+        if powers is not None:
+            powers.append(pw)
     
     return (
         np.array(grid_inputs),
         np.array(grid_targets),
         np.array(wind_speeds),
-        np.array(powers)
+        np.array(powers) if powers is not None else None
     )
 
 
@@ -244,13 +252,17 @@ def create_sequences(
 class Stage2Trainer:
     """阶段2训练器：冻结主干，训练校正头"""
     
-    def __init__(self, configs, turbine_coord: tuple, checkpoint_path: str = None):
+    def __init__(self, configs, turbine_coord: tuple, turbine_sample_coord: tuple = None,
+                 checkpoint_path: str = None, enable_power_training: bool = True):
         self.configs = configs
         self.device = configs.device
+        self.enable_power_training = enable_power_training
         
         # 初始化模型（启用时序LSTM风速校正）
+        sample_coords = [turbine_sample_coord] if turbine_sample_coord is not None else None
         self.model = MFWPN_Model(
             turbine_coords=[turbine_coord],
+            turbine_sample_coords=sample_coords,
             enable_wind_correction=True,
             use_temporal_correction=True,    # 使用时序LSTM
             wind_correction_hidden=128,      # 隐藏层维度
@@ -258,7 +270,7 @@ class Stage2Trainer:
             lstm_layers=2,                   # LSTM层数
             wind_correction_dropout=0.2,     # Dropout
             use_time_embedding=True,         # 时间嵌入
-            use_corrected_speed_for_power=True,
+            use_corrected_speed_for_power=self.enable_power_training,
             power_roi_size=5,
             power_conv_channels=32,
             power_mlp_hidden=64,
@@ -277,7 +289,7 @@ class Stage2Trainer:
         
         self.optimizer = torch.optim.Adam(trainable_params, lr=1e-3)
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', factor=0.5, patience=5, verbose=True
+            self.optimizer, mode='min', factor=0.5, patience=5
         )
         
         self.mse_loss = nn.MSELoss()
@@ -313,6 +325,19 @@ class Stage2Trainer:
     
     def set_normalizer(self, normalizer: Normalizer):
         self.normalizer = normalizer
+
+    def _compute_power_loss(self, power_pred, power_true):
+        if (not self.enable_power_training) or power_true is None or power_pred is None:
+            return None
+
+        pred = power_pred.squeeze(-1).squeeze(-1)
+        target = power_true
+        valid = torch.isfinite(target)
+
+        if not torch.any(valid):
+            return None
+
+        return torch.mean((pred[valid] - target[valid]) ** 2)
     
     def train_epoch(self, dataloader, ele):
         """训练一个 epoch"""
@@ -320,15 +345,21 @@ class Stage2Trainer:
         total_loss = 0
         wind_loss_sum = 0
         power_loss_sum = 0
+        power_batches = 0
         
         ele_tensor = torch.tensor(ele, dtype=torch.float32, device=self.device)
         
         for batch in dataloader:
-            grid_input, grid_target, wind_speed_true, power_true = batch
+            if len(batch) == 4:
+                grid_input, grid_target, wind_speed_true, power_true = batch
+            else:
+                grid_input, grid_target, wind_speed_true = batch
+                power_true = None
             
             grid_input = grid_input.float().to(self.device)
             wind_speed_true = wind_speed_true.float().to(self.device)
-            power_true = power_true.float().to(self.device)
+            if power_true is not None:
+                power_true = power_true.float().to(self.device)
             
             self.optimizer.zero_grad()
             
@@ -339,21 +370,24 @@ class Stage2Trainer:
             wind_loss = self.mse_loss(corrected_speed.squeeze(-1), wind_speed_true)
             
             # 功率预测损失
-            power_pred = outputs['power']  # [B, T, 1, 1]
-            power_loss = self.mse_loss(power_pred.squeeze(-1).squeeze(-1), power_true)
+            power_pred = outputs.get('power')
+            power_loss = self._compute_power_loss(power_pred, power_true)
             
             # 总损失
-            loss = wind_loss + power_loss
+            loss = wind_loss if power_loss is None else (wind_loss + power_loss)
             
             loss.backward()
             self.optimizer.step()
             
             total_loss += loss.item()
             wind_loss_sum += wind_loss.item()
-            power_loss_sum += power_loss.item()
+            if power_loss is not None:
+                power_loss_sum += power_loss.item()
+                power_batches += 1
         
         n = len(dataloader)
-        return total_loss / n, wind_loss_sum / n, power_loss_sum / n
+        avg_power_loss = (power_loss_sum / power_batches) if power_batches > 0 else None
+        return total_loss / n, wind_loss_sum / n, avg_power_loss
     
     @torch.no_grad()
     def evaluate(self, dataloader, ele):
@@ -362,32 +396,41 @@ class Stage2Trainer:
         total_loss = 0
         wind_loss_sum = 0
         power_loss_sum = 0
+        power_batches = 0
         
         ele_tensor = torch.tensor(ele, dtype=torch.float32, device=self.device)
         
         for batch in dataloader:
-            grid_input, grid_target, wind_speed_true, power_true = batch
+            if len(batch) == 4:
+                grid_input, grid_target, wind_speed_true, power_true = batch
+            else:
+                grid_input, grid_target, wind_speed_true = batch
+                power_true = None
             
             grid_input = grid_input.float().to(self.device)
             wind_speed_true = wind_speed_true.float().to(self.device)
-            power_true = power_true.float().to(self.device)
+            if power_true is not None:
+                power_true = power_true.float().to(self.device)
             
             outputs = self.model(grid_input, ele_tensor)
             
             corrected_speed = outputs['corrected_speed']
             wind_loss = self.mse_loss(corrected_speed.squeeze(-1), wind_speed_true)
             
-            power_pred = outputs['power']
-            power_loss = self.mse_loss(power_pred.squeeze(-1).squeeze(-1), power_true)
+            power_pred = outputs.get('power')
+            power_loss = self._compute_power_loss(power_pred, power_true)
             
-            loss = wind_loss + power_loss
+            loss = wind_loss if power_loss is None else (wind_loss + power_loss)
             
             total_loss += loss.item()
             wind_loss_sum += wind_loss.item()
-            power_loss_sum += power_loss.item()
+            if power_loss is not None:
+                power_loss_sum += power_loss.item()
+                power_batches += 1
         
         n = len(dataloader)
-        return total_loss / n, wind_loss_sum / n, power_loss_sum / n
+        avg_power_loss = (power_loss_sum / power_batches) if power_batches > 0 else None
+        return total_loss / n, wind_loss_sum / n, avg_power_loss
     
     def train(self, train_loader, val_loader, ele, num_epochs: int, save_path: str):
         """完整训练流程"""
@@ -401,8 +444,12 @@ class Stage2Trainer:
             self.scheduler.step(val_loss)
             
             print(f"Epoch {epoch+1}/{num_epochs}")
-            print(f"  Train - Total: {train_loss:.4f}, Wind: {train_wind:.4f}, Power: {train_power:.4f}")
-            print(f"  Val   - Total: {val_loss:.4f}, Wind: {val_wind:.4f}, Power: {val_power:.4f}")
+            train_msg = f"  Train - Total: {train_loss:.4f}, Wind: {train_wind:.4f}"
+            val_msg = f"  Val   - Total: {val_loss:.4f}, Wind: {val_wind:.4f}"
+            train_msg += f", Power: {train_power:.4f}" if train_power is not None else ", Power: N/A"
+            val_msg += f", Power: {val_power:.4f}" if val_power is not None else ", Power: N/A"
+            print(train_msg)
+            print(val_msg)
             
             if val_loss < best_loss:
                 best_loss = val_loss
@@ -439,40 +486,187 @@ class Stage2Trainer:
             grid_tensor = grid_tensor.unsqueeze(0)
         
         outputs = self.model(grid_tensor, ele_tensor)
-        
+
         result = {
             'wind_field': outputs['wind'].cpu().numpy(),
             'interp_speed': outputs['interp_speed'].cpu().numpy(),
             'corrected_speed': outputs['corrected_speed'].cpu().numpy(),
-            'power': outputs['power'].cpu().numpy(),
         }
+        if outputs.get('power') is not None:
+            result['power'] = outputs['power'].cpu().numpy()
         
         # 反归一化
         if self.normalizer:
             result['corrected_speed_original'] = self.normalizer.inverse_transform(
                 result['corrected_speed'], 'wind_speed'
             )
-            result['power_original'] = self.normalizer.inverse_transform(
-                result['power'], 'power'
-            )
+            if 'power' in result and 'power' in self.normalizer.stats:
+                result['power_original'] = self.normalizer.inverse_transform(
+                    result['power'], 'power'
+                )
         
         return result
 
 
 # ==================== 主函数 ====================
 
+def parse_args():
+    parser = argparse.ArgumentParser(description='Stage2 training with optional power supervision')
+    parser.add_argument('--wind-only', action='store_true', help='Train only wind correction head without power supervision')
+    parser.add_argument('--allow-missing-power', action='store_true', help='Allow NaN values in power labels and mask them in loss')
+    parser.add_argument('--turbine-dir', type=str, default='data/turbine_points', help='Directory containing turbine_wind_speed.npy, turbine_dates.npy and optional turbine_power.npy')
+    parser.add_argument('--power-path', type=str, default=None, help='Path to turbine power npy; default is <turbine-dir>/turbine_power.npy')
+    parser.add_argument('--turbine-coord', type=str, default=None, help='Grid coordinate as "h,w" (e.g. "32,34"). If not set, try turbine_meta.json then fallback.')
+    parser.add_argument('--turbine-lat', type=float, default=None, help='Turbine latitude in decimal degrees')
+    parser.add_argument('--turbine-lon', type=float, default=None, help='Turbine longitude in decimal degrees')
+    parser.add_argument('--lat-min', type=float, default=38.25, help='Grid south boundary latitude')
+    parser.add_argument('--lat-max', type=float, default=54.0, help='Grid north boundary latitude')
+    parser.add_argument('--lon-min', type=float, default=116.0, help='Grid west boundary longitude')
+    parser.add_argument('--lon-max', type=float, default=135.75, help='Grid east boundary longitude')
+    parser.add_argument('--coord-rounding', choices=['round', 'floor', 'ceil'], default='round',
+                        help='Rounding strategy when converting decimal lat/lon to integer grid indices')
+    parser.add_argument('--test-start-date', type=str, default='2025-11-01',
+                        help='Test split start date (inclusive), format YYYY-MM-DD')
+    parser.add_argument('--split-mode', choices=['date', 'ratio'], default='date',
+                        help='Dataset split mode: by date threshold or by ratios')
+    parser.add_argument('--train-ratio', type=float, default=0.7,
+                        help='Train ratio when --split-mode ratio')
+    parser.add_argument('--val-ratio', type=float, default=0.1,
+                        help='Validation ratio when --split-mode ratio')
+    parser.add_argument('--test-ratio', type=float, default=0.2,
+                        help='Test ratio when --split-mode ratio')
+    parser.add_argument('--ratio-split-strategy', choices=['chronological', 'random'], default='chronological',
+                        help='How to split when using ratio mode')
+    parser.add_argument('--split-random-state', type=int, default=42,
+                        help='Random seed for random ratio split')
+    parser.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto',
+                        help='Training device selection')
+    parser.add_argument('--result-dir', type=str, default='result/exp', help='Directory to save stage2 experiment outputs')
+    return parser.parse_args()
+
+
+def latlon_to_grid(lat: float, lon: float, lat_min: float, lat_max: float, lon_min: float, lon_max: float,
+                   grid_h: int, grid_w: int, rounding: str):
+    if not (lat_min < lat_max and lon_min < lon_max):
+        raise ValueError('Invalid grid extent for lat/lon conversion.')
+    if grid_h <= 1 or grid_w <= 1:
+        raise ValueError('Grid shape must be greater than 1 for lat/lon conversion.')
+
+    frac_h = (lat_max - lat) / (lat_max - lat_min) * (grid_h - 1)
+    frac_w = (lon - lon_min) / (lon_max - lon_min) * (grid_w - 1)
+
+    if rounding == 'floor':
+        h_idx = int(np.floor(frac_h))
+        w_idx = int(np.floor(frac_w))
+    elif rounding == 'ceil':
+        h_idx = int(np.ceil(frac_h))
+        w_idx = int(np.ceil(frac_w))
+    else:
+        h_idx = int(np.round(frac_h))
+        w_idx = int(np.round(frac_w))
+
+    h_idx = max(0, min(grid_h - 1, h_idx))
+    w_idx = max(0, min(grid_w - 1, w_idx))
+    return (h_idx, w_idx), (float(frac_h), float(frac_w))
+
+
+def resolve_turbine_coord(coord_arg: str, turbine_dir: str, default_coord: tuple,
+                          turbine_lat: float, turbine_lon: float,
+                          lat_min: float, lat_max: float, lon_min: float, lon_max: float,
+                          grid_h: int, grid_w: int, coord_rounding: str):
+    if coord_arg:
+        h_str, w_str = coord_arg.split(',')
+        return (int(h_str), int(w_str)), None
+
+    if turbine_lat is not None and turbine_lon is not None:
+        coord, frac = latlon_to_grid(
+            lat=turbine_lat,
+            lon=turbine_lon,
+            lat_min=lat_min,
+            lat_max=lat_max,
+            lon_min=lon_min,
+            lon_max=lon_max,
+            grid_h=grid_h,
+            grid_w=grid_w,
+            rounding=coord_rounding,
+        )
+        return coord, {
+            'lat': turbine_lat,
+            'lon': turbine_lon,
+            'frac_h': frac[0],
+            'frac_w': frac[1],
+            'rounding': coord_rounding,
+        }
+
+    meta_path = os.path.join(turbine_dir, 'turbine_meta.json')
+    if os.path.exists(meta_path):
+        import json
+        with open(meta_path, 'r', encoding='utf-8') as f:
+            meta = json.load(f)
+        if turbine_lat is None and turbine_lon is None and 'latitude' in meta and 'longitude' in meta:
+            coord, frac = latlon_to_grid(
+                lat=float(meta['latitude']),
+                lon=float(meta['longitude']),
+                lat_min=float(meta.get('grid_extent', {}).get('lat_min', lat_min)),
+                lat_max=float(meta.get('grid_extent', {}).get('lat_max', lat_max)),
+                lon_min=float(meta.get('grid_extent', {}).get('lon_min', lon_min)),
+                lon_max=float(meta.get('grid_extent', {}).get('lon_max', lon_max)),
+                grid_h=grid_h,
+                grid_w=grid_w,
+                rounding=coord_rounding,
+            )
+            return coord, {
+                'lat': float(meta['latitude']),
+                'lon': float(meta['longitude']),
+                'frac_h': frac[0],
+                'frac_w': frac[1],
+                'rounding': coord_rounding,
+            }
+        grid_coord = meta.get('grid_coord')
+        if isinstance(grid_coord, list) and len(grid_coord) == 2:
+            return (int(grid_coord[0]), int(grid_coord[1])), None
+
+    return default_coord, None
+
+
 def main():
+    args = parse_args()
+    if args.device == 'cpu':
+        configs.device = torch.device('cpu')
+    elif args.device == 'cuda':
+        configs.device = torch.device('cuda:0')
+    else:
+        configs.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
     print("=" * 60)
     print("Stage 2 Training: Wind Speed Correction + Power Prediction")
     print("=" * 60)
+    print(f"Device: {configs.device}")
     
     # ========== 1. 配置 ==========
     # 精确点坐标 (需要根据实际位置计算)
     # 辰阳风电场坐标需要转换为网格索引
-    TURBINE_COORD = (32, 34)  # 辰阳风电场: 124.6138°E, 45.8470°N
+    DEFAULT_TURBINE_COORD = (32, 34)
+    TURBINE_COORD, coord_detail = resolve_turbine_coord(
+        args.turbine_coord,
+        args.turbine_dir,
+        DEFAULT_TURBINE_COORD,
+        args.turbine_lat,
+        args.turbine_lon,
+        args.lat_min,
+        args.lat_max,
+        args.lon_min,
+        args.lon_max,
+        64,
+        80,
+        args.coord_rounding,
+    )
+    TURBINE_SAMPLE_COORD = None
+    if coord_detail is not None:
+        TURBINE_SAMPLE_COORD = (coord_detail['frac_h'], coord_detail['frac_w'])
     
     GRID_START_DATE = "2020-01-01"  # UTC时间
-    TEST_START_DATE = "2025-08-01"  # 测试集起始日期（北京时间）
+    TEST_START_DATE = args.test_start_date
     BATCH_SIZE = 8
     NUM_EPOCHS = 50
     
@@ -499,13 +693,39 @@ def main():
     ele = (ele - ele.mean()) / ele.std()
     
     # 精确点数据
-    turbine_dir = "data/turbine_points"
-    wind_speed = np.load(f"{turbine_dir}/turbine_wind_speed.npy")
-    power = np.load(f"{turbine_dir}/turbine_power.npy")
-    dates = np.load(f"{turbine_dir}/turbine_dates.npy", allow_pickle=True)
+    turbine_dir = args.turbine_dir
+    baseline_name = os.path.basename(os.path.normpath(turbine_dir)) or 'default'
+    result_dir = os.path.join(args.result_dir, baseline_name)
+    os.makedirs(result_dir, exist_ok=True)
+
+    wind_path = os.path.join(turbine_dir, 'turbine_wind_speed.npy')
+    dates_path = os.path.join(turbine_dir, 'turbine_dates.npy')
+    power_path = args.power_path if args.power_path is not None else os.path.join(turbine_dir, 'turbine_power.npy')
+
+    if not os.path.exists(wind_path):
+        raise FileNotFoundError(f'Turbine wind file not found: {wind_path}')
+    if not os.path.exists(dates_path):
+        raise FileNotFoundError(f'Turbine dates file not found: {dates_path}')
+
+    wind_speed = np.load(wind_path)
+    power = None
+    if not args.wind_only:
+        if os.path.exists(power_path):
+            power = np.load(power_path)
+        else:
+            raise FileNotFoundError(f"Power data file not found: {power_path}")
+    dates = np.load(dates_path, allow_pickle=True)
     print(f"  Turbine wind speed: {wind_speed.shape}")
-    print(f"  Turbine power: {power.shape}")
+    print(f"  Turbine power: {power.shape}" if power is not None else "  Turbine power: disabled (wind-only)")
     print(f"  Date range: {dates[0]} ~ {dates[-1]}")
+    print(f"  Turbine coord (grid): {TURBINE_COORD}")
+    if coord_detail is not None:
+        print(
+            f"  Coord source lat/lon=({coord_detail['lat']:.6f}, {coord_detail['lon']:.6f}), "
+            f"frac_idx=({coord_detail['frac_h']:.4f}, {coord_detail['frac_w']:.4f}), "
+            f"rounding={coord_detail['rounding']}"
+        )
+    print(f"  Result dir: {result_dir}")
     
     # ========== 3. 时间对齐 ==========
     print("\n[2] Aligning grid data with turbine data...")
@@ -521,7 +741,8 @@ def main():
     # 筛选有效的精确点数据
     valid_dates = dates[valid_days]
     wind_speed = wind_speed[valid_days]
-    power = power[valid_days]
+    if power is not None:
+        power = power[valid_days]
     print(f"  Aligned grid: {aligned_grid.shape}")
     print(f"  Valid turbine days: {len(valid_days)}")
     print(f"  Valid date range: {valid_dates[0]} ~ {valid_dates[-1]}")
@@ -536,11 +757,34 @@ def main():
     print(f"  Wind speed: mean={wind_speed.mean():.2f}, std={wind_speed.std():.2f}")
     print(f"  -> Normalized: mean={wind_speed_norm.mean():.4f}, std={wind_speed_norm.std():.4f}")
     
-    # 功率: Min-Max [0, 1]
-    normalizer.fit_minmax(power, 'power', feature_range=(0, 1))
-    power_norm = normalizer.transform(power, 'power')
-    print(f"  Power: min={power.min():.2f}, max={power.max():.2f}")
-    print(f"  -> Normalized: min={power_norm.min():.4f}, max={power_norm.max():.4f}")
+    power_norm = None
+    if power is not None:
+        if np.isfinite(power).all():
+            normalizer.fit_minmax(power, 'power', feature_range=(0, 1))
+            power_norm = normalizer.transform(power, 'power')
+            print(f"  Power: min={power.min():.2f}, max={power.max():.2f}")
+            print(f"  -> Normalized: min={power_norm.min():.4f}, max={power_norm.max():.4f}")
+        else:
+            if not args.allow_missing_power:
+                raise ValueError("Power data contains missing values (NaN/Inf). Use --allow-missing-power to continue.")
+            valid_mask = np.isfinite(power)
+            if not np.any(valid_mask):
+                print("  Power: no valid values found, fallback to wind-only training for this run.")
+                power = None
+                power_norm = None
+            else:
+                pmin = power[valid_mask].min()
+                pmax = power[valid_mask].max()
+                normalizer.stats['power'] = {
+                    'type': 'minmax',
+                    'min': pmin,
+                    'max': pmax,
+                    'range': (0, 1)
+                }
+                power_norm = np.full(power.shape, np.nan, dtype=np.float32)
+                power_norm[valid_mask] = normalizer.transform(power[valid_mask], 'power').astype(np.float32)
+                print(f"  Power: valid={valid_mask.sum()}, missing={(~valid_mask).sum()}")
+                print(f"  -> Normalized valid range: min={np.nanmin(power_norm):.4f}, max={np.nanmax(power_norm):.4f}")
     
     # 保存归一化参数
     normalizer.save(f"{turbine_dir}/normalizer.npy")
@@ -554,63 +798,124 @@ def main():
     print(f"  Grid input: {grid_input.shape}")
     print(f"  Grid target: {grid_target.shape}")
     print(f"  Wind speed: {ws_seq.shape}")
-    print(f"  Power: {pw_seq.shape}")
+    print(f"  Power: {pw_seq.shape}" if pw_seq is not None else "  Power: N/A")
     
     # ========== 6. 划分数据集 ==========
-    # 测试集：2025-08-01 之后的数据
-    # 训练集和验证集：2025-08-01 之前的数据
     print("\n[5] Splitting dataset by date...")
-    
-    # 找到测试集起始索引
-    test_start = datetime.strptime(TEST_START_DATE, "%Y-%m-%d")
-    test_start_idx = None
-    
-    for i, date_str in enumerate(valid_dates):
-        date = datetime.strptime(str(date_str), "%Y-%m-%d")
-        if date >= test_start:
-            test_start_idx = i
-            break
-    
-    if test_start_idx is None:
-        print(f"  Warning: No data found after {TEST_START_DATE}, using last 10% as test")
-        test_start_idx = int(len(valid_dates) * 0.9)
-    
-    print(f"  Test start date: {valid_dates[test_start_idx]} (index {test_start_idx})")
-    print(f"  Test end date: {valid_dates[-1]}")
-    
-    # 序列索引对应关系：序列i的输出对应valid_dates[i+1]
-    # 所以测试集序列索引应该从 test_start_idx - 1 开始
-    test_seq_start = max(0, test_start_idx - 1)
-    
-    # 划分索引
-    train_val_indices = np.arange(test_seq_start)
-    test_indices = np.arange(test_seq_start, len(grid_input))
-    
-    # 从训练+验证集中划分出验证集 (10%)
-    if len(train_val_indices) > 1:
-        train_idx, val_idx = train_test_split(train_val_indices, test_size=0.1, random_state=42)
+    seq_target_dates = valid_dates[1:1 + len(grid_input)]
+
+    if args.split_mode == 'ratio':
+        ratios = np.array([args.train_ratio, args.val_ratio, args.test_ratio], dtype=np.float64)
+        if np.any(ratios <= 0):
+            raise ValueError('train/val/test ratios must all be > 0 in ratio split mode.')
+        if not np.isclose(ratios.sum(), 1.0, atol=1e-6):
+            raise ValueError(
+                f'Ratios must sum to 1.0, got train+val+test={ratios.sum():.6f}.')
+
+        n_seq = len(grid_input)
+        if n_seq < 5:
+            raise ValueError(f'Not enough sequences for ratio split: {n_seq}')
+
+        if args.ratio_split_strategy == 'chronological':
+            train_count = int(np.floor(n_seq * args.train_ratio))
+            val_count = int(np.floor(n_seq * args.val_ratio))
+            test_count = n_seq - train_count - val_count
+
+            if min(train_count, val_count, test_count) <= 0:
+                raise ValueError(
+                    f'Invalid split counts train={train_count}, val={val_count}, test={test_count}.')
+
+            train_idx = np.arange(0, train_count)
+            val_idx = np.arange(train_count, train_count + val_count)
+            test_indices = np.arange(train_count + val_count, n_seq)
+        else:
+            all_idx = np.arange(n_seq)
+            train_val_idx, test_indices = train_test_split(
+                all_idx,
+                test_size=args.test_ratio,
+                random_state=args.split_random_state,
+                shuffle=True,
+            )
+            rel_val_ratio = args.val_ratio / (args.train_ratio + args.val_ratio)
+            train_idx, val_idx = train_test_split(
+                train_val_idx,
+                test_size=rel_val_ratio,
+                random_state=args.split_random_state,
+                shuffle=True,
+            )
+
+        print(
+            f"  Split mode: ratio ({args.ratio_split_strategy}) | "
+            f"train={args.train_ratio:.2f}, val={args.val_ratio:.2f}, test={args.test_ratio:.2f}"
+        )
     else:
-        train_idx = train_val_indices
-        val_idx = np.array([], dtype=int)
+        test_start = datetime.strptime(TEST_START_DATE, "%Y-%m-%d")
+        test_start_idx = None
+
+        for i, date_str in enumerate(valid_dates):
+            date = datetime.strptime(str(date_str), "%Y-%m-%d")
+            if date >= test_start:
+                test_start_idx = i
+                break
+
+        if test_start_idx is None:
+            print(f"  Warning: No data found after {TEST_START_DATE}, using last 10% as test")
+            test_start_idx = int(len(valid_dates) * 0.9)
+
+        print(f"  Test start date: {valid_dates[test_start_idx]} (index {test_start_idx})")
+        print(f"  Test end date: {valid_dates[-1]}")
+
+        # 序列索引对应关系：序列i的输出对应valid_dates[i+1]
+        # 所以测试集序列索引应该从 test_start_idx - 1 开始
+        test_seq_start = max(0, test_start_idx - 1)
+        train_val_indices = np.arange(test_seq_start)
+        test_indices = np.arange(test_seq_start, len(grid_input))
+
+        if len(train_val_indices) > 1:
+            train_idx, val_idx = train_test_split(
+                train_val_indices,
+                test_size=0.1,
+                random_state=args.split_random_state,
+                shuffle=True,
+            )
+        else:
+            train_idx = train_val_indices
+            val_idx = np.array([], dtype=int)
     
-    train_dataset = TurbineDataset(
-        grid_input[train_idx], grid_target[train_idx],
-        ws_seq[train_idx], pw_seq[train_idx],
-        indices=train_idx
-    )
-    val_dataset = TurbineDataset(
-        grid_input[val_idx], grid_target[val_idx],
-        ws_seq[val_idx], pw_seq[val_idx],
-        indices=val_idx
-    ) if len(val_idx) > 0 else None
-    test_dataset = TurbineDataset(
-        grid_input[test_indices], grid_target[test_indices],
-        ws_seq[test_indices], pw_seq[test_indices],
-        indices=test_indices
-    )
+    if pw_seq is not None:
+        train_dataset = TurbineDataset(
+            grid_input[train_idx], grid_target[train_idx],
+            ws_seq[train_idx], pw_seq[train_idx],
+            indices=train_idx
+        )
+        val_dataset = TurbineDataset(
+            grid_input[val_idx], grid_target[val_idx],
+            ws_seq[val_idx], pw_seq[val_idx],
+            indices=val_idx
+        ) if len(val_idx) > 0 else None
+        test_dataset = TurbineDataset(
+            grid_input[test_indices], grid_target[test_indices],
+            ws_seq[test_indices], pw_seq[test_indices],
+            indices=test_indices
+        )
+    else:
+        train_dataset = TurbineDataset(
+            grid_input[train_idx], grid_target[train_idx],
+            ws_seq[train_idx], None,
+            indices=train_idx
+        )
+        val_dataset = TurbineDataset(
+            grid_input[val_idx], grid_target[val_idx],
+            ws_seq[val_idx], None,
+            indices=val_idx
+        ) if len(val_idx) > 0 else None
+        test_dataset = TurbineDataset(
+            grid_input[test_indices], grid_target[test_indices],
+            ws_seq[test_indices], None,
+            indices=test_indices
+        )
     
-    # 保存测试集日期信息
-    test_dates = valid_dates[test_seq_start + 1:]  # +1因为输出对应下一天
+    test_dates = seq_target_dates[test_indices] if len(test_indices) > 0 else np.array([], dtype=object)
     
     print(f"  Train: {len(train_dataset)} samples")
     print(f"  Val: {len(val_dataset) if val_dataset else 0} samples")
@@ -623,11 +928,28 @@ def main():
     
     # ========== 7. 训练 ==========
     print("\n[6] Initializing trainer...")
-    trainer = Stage2Trainer(
-        configs,
-        turbine_coord=TURBINE_COORD,
-        checkpoint_path="chkfile/checkpoint_mfwpn.chk"  # 预训练权重
-    )
+    try:
+        trainer = Stage2Trainer(
+            configs,
+            turbine_coord=TURBINE_COORD,
+            turbine_sample_coord=TURBINE_SAMPLE_COORD,
+            checkpoint_path="chkfile/checkpoint_mfwpn.chk",  # 预训练权重
+            enable_power_training=(pw_seq is not None and (not args.wind_only))
+        )
+    except RuntimeError as e:
+        msg = str(e).lower()
+        if configs.device.type == 'cuda' and ('no kernel image is available' in msg or 'cuda error' in msg):
+            print('CUDA initialization failed, fallback to CPU...')
+            configs.device = torch.device('cpu')
+            trainer = Stage2Trainer(
+                configs,
+                turbine_coord=TURBINE_COORD,
+                turbine_sample_coord=TURBINE_SAMPLE_COORD,
+                checkpoint_path="chkfile/checkpoint_mfwpn.chk",  # 预训练权重
+                enable_power_training=(pw_seq is not None and (not args.wind_only))
+            )
+        else:
+            raise
     trainer.set_normalizer(normalizer)
     
     print("\n[7] Training...")
@@ -635,7 +957,7 @@ def main():
         trainer.train(
             train_loader, val_loader, ele,
             num_epochs=NUM_EPOCHS,
-            save_path="chkfile/checkpoint_stage2.chk"
+            save_path=os.path.join(result_dir, "checkpoint_stage2.chk")
         )
     else:
         print("  Warning: No validation data, training with train data only")
@@ -643,13 +965,15 @@ def main():
         for epoch in range(NUM_EPOCHS):
             train_loss, train_wind, train_power = trainer.train_epoch(train_loader, ele)
             print(f"Epoch {epoch+1}/{NUM_EPOCHS} - Loss: {train_loss:.4f}")
-        trainer.save_model("chkfile/checkpoint_stage2.chk")
+        trainer.save_model(os.path.join(result_dir, "checkpoint_stage2.chk"))
     
     # ========== 8. 测试 ==========
     print("\n[8] Testing...")
-    trainer.load_model("chkfile/checkpoint_stage2.chk")
+    trainer.load_model(os.path.join(result_dir, "checkpoint_stage2.chk"))
     test_loss, test_wind, test_power = trainer.evaluate(test_loader, ele)
-    print(f"  Test - Total: {test_loss:.4f}, Wind: {test_wind:.4f}, Power: {test_power:.4f}")
+    test_msg = f"  Test - Total: {test_loss:.4f}, Wind: {test_wind:.4f}"
+    test_msg += f", Power: {test_power:.4f}" if test_power is not None else ", Power: N/A"
+    print(test_msg)
     
     # ========== 9. 保存测试预测结果 ==========
     print("\n[9] Saving predictions...")
@@ -662,29 +986,35 @@ def main():
     
     with torch.no_grad():
         for batch in test_loader:
-            grid_input, _, wind_true, power_true = batch
+            if len(batch) == 4:
+                grid_input, _, wind_true, power_true = batch
+            else:
+                grid_input, _, wind_true = batch
+                power_true = None
             grid_input = grid_input.float().to(configs.device)
             
             outputs = trainer.model(grid_input, ele_tensor)
-            
-            all_preds.append({
-                'corrected_speed': outputs['corrected_speed'].cpu().numpy(),
-                'power': outputs['power'].cpu().numpy()
-            })
+
+            pred_item = {'corrected_speed': outputs['corrected_speed'].cpu().numpy()}
+            if trainer.enable_power_training and outputs.get('power') is not None:
+                pred_item['power'] = outputs['power'].cpu().numpy()
+            all_preds.append(pred_item)
             all_true_wind.append(wind_true.numpy())
-            all_true_power.append(power_true.numpy())
+            if power_true is not None:
+                all_true_power.append(power_true.numpy())
     
     # 合并预测结果
     pred_wind = np.concatenate([p['corrected_speed'] for p in all_preds], axis=0)
-    pred_power = np.concatenate([p['power'] for p in all_preds], axis=0)
     true_wind = np.concatenate(all_true_wind, axis=0)
-    true_power = np.concatenate(all_true_power, axis=0)
+    has_power_eval = trainer.enable_power_training and len(all_true_power) > 0 and all('power' in p for p in all_preds)
+    pred_power = np.concatenate([p['power'] for p in all_preds], axis=0) if has_power_eval else None
+    true_power = np.concatenate(all_true_power, axis=0) if has_power_eval else None
     
     # 反归一化
     pred_wind_orig = normalizer.inverse_transform(pred_wind.squeeze(), 'wind_speed')
-    pred_power_orig = normalizer.inverse_transform(pred_power.squeeze(), 'power')
     true_wind_orig = normalizer.inverse_transform(true_wind, 'wind_speed')
-    true_power_orig = normalizer.inverse_transform(true_power, 'power')
+    pred_power_orig = normalizer.inverse_transform(pred_power.squeeze(), 'power') if pred_power is not None else None
+    true_power_orig = normalizer.inverse_transform(true_power, 'power') if true_power is not None else None
     
     # ========== 10. 计算每小时的MAE和RMSE ==========
     print("\n=== Test Results by Hour (Original Scale) ===")
@@ -714,54 +1044,65 @@ def main():
     print("-" * 30)
     print(f"{'Avg':<6} {np.mean(wind_mae_hourly):<12.3f} {np.mean(wind_rmse_hourly):<12.3f}")
     
-    print("\n--- Power ---")
-    print(f"{'Hour':<6} {'MAE (MW)':<12} {'RMSE (MW)':<12}")
-    print("-" * 30)
-    
     power_mae_hourly = []
     power_rmse_hourly = []
-    
-    for h in range(24):
-        if pred_power_orig.ndim == 1:
-            h_pred = pred_power_orig[h::24]
-            h_true = true_power_orig[:, h] if true_power_orig.ndim > 1 else true_power_orig[h::24]
-        else:
-            h_pred = pred_power_orig[:, h]
-            h_true = true_power_orig[:, h]
-        
-        mae = np.abs(h_pred - h_true).mean()
-        rmse = np.sqrt(((h_pred - h_true) ** 2).mean())
-        power_mae_hourly.append(mae)
-        power_rmse_hourly.append(rmse)
-        print(f"{h+1:<6} {mae:<12.3f} {rmse:<12.3f}")
-    
-    print("-" * 30)
-    print(f"{'Avg':<6} {np.mean(power_mae_hourly):<12.3f} {np.mean(power_rmse_hourly):<12.3f}")
+    if pred_power_orig is not None and true_power_orig is not None:
+        print("\n--- Power ---")
+        print(f"{'Hour':<6} {'MAE (MW)':<12} {'RMSE (MW)':<12}")
+        print("-" * 30)
+
+        for h in range(24):
+            if pred_power_orig.ndim == 1:
+                h_pred = pred_power_orig[h::24]
+                h_true = true_power_orig[:, h] if true_power_orig.ndim > 1 else true_power_orig[h::24]
+            else:
+                h_pred = pred_power_orig[:, h]
+                h_true = true_power_orig[:, h]
+
+            mae = np.abs(h_pred - h_true).mean()
+            rmse = np.sqrt(((h_pred - h_true) ** 2).mean())
+            power_mae_hourly.append(mae)
+            power_rmse_hourly.append(rmse)
+            print(f"{h+1:<6} {mae:<12.3f} {rmse:<12.3f}")
+
+        print("-" * 30)
+        print(f"{'Avg':<6} {np.mean(power_mae_hourly):<12.3f} {np.mean(power_rmse_hourly):<12.3f}")
+    else:
+        print("\n--- Power ---")
+        print("Power evaluation skipped (wind-only mode or missing power labels).")
     
     # 总体统计
     wind_mae = np.mean(wind_mae_hourly)
     wind_rmse = np.mean(wind_rmse_hourly)
-    power_mae = np.mean(power_mae_hourly)
-    power_rmse = np.mean(power_rmse_hourly)
+    power_mae = np.mean(power_mae_hourly) if len(power_mae_hourly) > 0 else None
+    power_rmse = np.mean(power_rmse_hourly) if len(power_rmse_hourly) > 0 else None
     
     print(f"\n=== Overall Test Results ===")
     print(f"  Wind Speed - MAE: {wind_mae:.3f} m/s, RMSE: {wind_rmse:.3f} m/s")
-    print(f"  Power      - MAE: {power_mae:.3f} MW,  RMSE: {power_rmse:.3f} MW")
+    if power_mae is not None and power_rmse is not None:
+        print(f"  Power      - MAE: {power_mae:.3f} MW,  RMSE: {power_rmse:.3f} MW")
+    else:
+        print("  Power      - skipped")
     
     # 保存预测结果
-    np.savez(
-        f"{turbine_dir}/test_predictions.npz",
-        pred_wind=pred_wind_orig,
-        pred_power=pred_power_orig,
-        true_wind=true_wind_orig,
-        true_power=true_power_orig,
-        test_dates=test_dates,
-        wind_mae_hourly=np.array(wind_mae_hourly),
-        wind_rmse_hourly=np.array(wind_rmse_hourly),
-        power_mae_hourly=np.array(power_mae_hourly),
-        power_rmse_hourly=np.array(power_rmse_hourly)
-    )
-    print(f"\nPredictions saved to {turbine_dir}/test_predictions.npz")
+    save_payload = {
+        'pred_wind': pred_wind_orig,
+        'true_wind': true_wind_orig,
+        'test_dates': test_dates,
+        'wind_mae_hourly': np.array(wind_mae_hourly),
+        'wind_rmse_hourly': np.array(wind_rmse_hourly),
+    }
+    if pred_power_orig is not None and true_power_orig is not None:
+        save_payload.update({
+            'pred_power': pred_power_orig,
+            'true_power': true_power_orig,
+            'power_mae_hourly': np.array(power_mae_hourly),
+            'power_rmse_hourly': np.array(power_rmse_hourly),
+        })
+
+    pred_out_path = os.path.join(result_dir, 'test_predictions.npz')
+    np.savez(pred_out_path, **save_payload)
+    print(f"\nPredictions saved to {pred_out_path}")
     
     print("\n" + "=" * 60)
     print("Stage 2 Training Complete!")

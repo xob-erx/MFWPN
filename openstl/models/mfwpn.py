@@ -22,6 +22,19 @@ def _validate_turbine_coords(coords: Iterable[Tuple[int, int]], height: int, wid
     return validated
 
 
+def _validate_turbine_sample_coords(coords: Iterable[Tuple[float, float]], height: int, width: int) -> Sequence[Tuple[float, float]]:
+    validated = []
+    for idx, coord in enumerate(coords):
+        if len(coord) != 2:
+            raise ValueError(f"Turbine sample coordinate at index {idx} must contain two values (h, w), got {coord}.")
+        h, w = float(coord[0]), float(coord[1])
+        if not (0.0 <= h <= height - 1 and 0.0 <= w <= width - 1):
+            raise ValueError(
+                f"Turbine sample coordinate {(h, w)} is outside the feature map with shape ({height}, {width}).")
+        validated.append((h, w))
+    return validated
+
+
 class WindCorrectionHead(nn.Module):
     """增强版风速校正头：残差学习 + 丰富输入特征
     
@@ -31,7 +44,8 @@ class WindCorrectionHead(nn.Module):
     3. 更深网络: 增加层数 + LayerNorm + Dropout
     """
 
-    def __init__(self, feature_dim: int, turbine_coords: Sequence[Tuple[int, int]], 
+    def __init__(self, feature_dim: int, turbine_coords: Sequence[Tuple[int, int]],
+                 turbine_sample_coords: Optional[Sequence[Tuple[float, float]]] = None,
                  roi_size: int = 5, hidden_dim: int = 128, feature_hw: Tuple[int, int] = (64, 80),
                  use_residual: bool = True, dropout: float = 0.1):
         super().__init__()
@@ -43,6 +57,8 @@ class WindCorrectionHead(nn.Module):
         self.pad = roi_size // 2
         self.feature_hw = feature_hw
         self.turbine_coords = _validate_turbine_coords(turbine_coords, *feature_hw)
+        sample_coords_raw = turbine_sample_coords if turbine_sample_coords is not None else turbine_coords
+        self.turbine_sample_coords = _validate_turbine_sample_coords(sample_coords_raw, *feature_hw)
         self.num_turbines = len(self.turbine_coords)
         self.hidden_dim = hidden_dim
 
@@ -94,7 +110,7 @@ class WindCorrectionHead(nn.Module):
         
         # 中心点采样网格
         norm_coords = []
-        for h_idx, w_idx in self.turbine_coords:
+        for h_idx, w_idx in self.turbine_sample_coords:
             y = 2.0 * h_idx / (feature_h - 1) - 1.0
             x = 2.0 * w_idx / (feature_w - 1) - 1.0
             norm_coords.append([x, y])
@@ -103,7 +119,7 @@ class WindCorrectionHead(nn.Module):
         
         # 3x3 邻域采样网格 (去掉中心点)
         neighbor_coords = []
-        for h_idx, w_idx in self.turbine_coords:
+        for h_idx, w_idx in self.turbine_sample_coords:
             for dh in [-1, 0, 1]:
                 for dw in [-1, 0, 1]:
                     if dh == 0 and dw == 0:
@@ -228,7 +244,8 @@ class TemporalWindCorrectionHead(nn.Module):
     4. 增强输入: 保留u/v分量、梯度、邻域特征
     """
 
-    def __init__(self, feature_dim: int, turbine_coords: Sequence[Tuple[int, int]], 
+    def __init__(self, feature_dim: int, turbine_coords: Sequence[Tuple[int, int]],
+                 turbine_sample_coords: Optional[Sequence[Tuple[float, float]]] = None,
                  roi_size: int = 5, hidden_dim: int = 128, 
                  lstm_hidden: int = 128, lstm_layers: int = 2,
                  dropout: float = 0.2, bidirectional: bool = True,
@@ -240,6 +257,8 @@ class TemporalWindCorrectionHead(nn.Module):
         self.pad = roi_size // 2
         self.feature_hw = feature_hw
         self.turbine_coords = _validate_turbine_coords(turbine_coords, *feature_hw)
+        sample_coords_raw = turbine_sample_coords if turbine_sample_coords is not None else turbine_coords
+        self.turbine_sample_coords = _validate_turbine_sample_coords(sample_coords_raw, *feature_hw)
         self.num_turbines = len(self.turbine_coords)
         self.use_time_embedding = use_time_embedding
         self.bidirectional = bidirectional
@@ -302,7 +321,7 @@ class TemporalWindCorrectionHead(nn.Module):
         
         # 中心点采样网格
         norm_coords = []
-        for h_idx, w_idx in self.turbine_coords:
+        for h_idx, w_idx in self.turbine_sample_coords:
             y = 2.0 * h_idx / (feature_h - 1) - 1.0
             x = 2.0 * w_idx / (feature_w - 1) - 1.0
             norm_coords.append([x, y])
@@ -311,7 +330,7 @@ class TemporalWindCorrectionHead(nn.Module):
         
         # 3x3 邻域采样网格 (去掉中心点)
         neighbor_coords = []
-        for h_idx, w_idx in self.turbine_coords:
+        for h_idx, w_idx in self.turbine_sample_coords:
             for dh in [-1, 0, 1]:
                 for dw in [-1, 0, 1]:
                     if dh == 0 and dw == 0:
@@ -439,7 +458,9 @@ class TemporalWindCorrectionHead(nn.Module):
 class TurbinePowerHead(nn.Module):
     """Predict turbine power from shared spatiotemporal features."""
 
-    def __init__(self, in_channels: int, turbine_coords: Sequence[Tuple[int, int]], roi_size: int = 5,
+    def __init__(self, in_channels: int, turbine_coords: Sequence[Tuple[int, int]],
+                 turbine_sample_coords: Optional[Sequence[Tuple[float, float]]] = None,
+                 roi_size: int = 5,
                  conv_channels: int = 32, mlp_hidden_dim: int = 64, feature_hw: Tuple[int, int] = (64, 80),
                  include_wind_speed: bool = True, use_corrected_speed: bool = False):
         super().__init__()
@@ -450,6 +471,8 @@ class TurbinePowerHead(nn.Module):
         self.pad = roi_size // 2
         self.feature_hw = feature_hw
         self.turbine_coords = _validate_turbine_coords(turbine_coords, *feature_hw)
+        sample_coords_raw = turbine_sample_coords if turbine_sample_coords is not None else turbine_coords
+        self.turbine_sample_coords = _validate_turbine_sample_coords(sample_coords_raw, *feature_hw)
         self.num_turbines = len(self.turbine_coords)
         self.include_wind_speed = include_wind_speed
         self.use_corrected_speed = use_corrected_speed
@@ -476,7 +499,7 @@ class TurbinePowerHead(nn.Module):
                 raise ValueError("feature_hw must both be greater than 1 when using wind speed sampling.")
 
             norm_coords = []
-            for h_idx, w_idx in self.turbine_coords:
+            for h_idx, w_idx in self.turbine_sample_coords:
                 y = 2.0 * h_idx / (feature_h - 1) - 1.0
                 x = 2.0 * w_idx / (feature_w - 1) - 1.0
                 norm_coords.append([x, y])
@@ -546,6 +569,7 @@ class MFWPN_Model(nn.Module):
     def __init__(self, hid_S=2, hid_T=256, N_S=2, N_T=8, model_type='gsta',
                  mlp_ratio=8., drop=0.0, drop_path=0.0, spatio_kernel_enc=3,
                  spatio_kernel_dec=3, act_inplace=True, turbine_coords: Optional[Sequence[Tuple[int, int]]] = None,
+                 turbine_sample_coords: Optional[Sequence[Tuple[float, float]]] = None,
                  power_roi_size: int = 5, power_conv_channels: int = 32, power_mlp_hidden: int = 64,
                  feature_hw: Tuple[int, int] = (64, 80), 
                  enable_wind_correction: bool = False, wind_correction_hidden: int = 128,
@@ -572,6 +596,7 @@ class MFWPN_Model(nn.Module):
         self.wind_correction_head: Optional[WindCorrectionHead] = None
         self.power_head: Optional[TurbinePowerHead] = None
         self._turbine_coords = turbine_coords
+        self._turbine_sample_coords = turbine_sample_coords
         self._feature_hw = feature_hw
         
         if turbine_coords:
@@ -582,6 +607,7 @@ class MFWPN_Model(nn.Module):
                     self.wind_correction_head = TemporalWindCorrectionHead(
                         feature_dim=hid_S,
                         turbine_coords=turbine_coords,
+                        turbine_sample_coords=turbine_sample_coords,
                         roi_size=power_roi_size,
                         hidden_dim=wind_correction_hidden,
                         lstm_hidden=lstm_hidden,
@@ -596,6 +622,7 @@ class MFWPN_Model(nn.Module):
                     self.wind_correction_head = WindCorrectionHead(
                         feature_dim=hid_S,
                         turbine_coords=turbine_coords,
+                        turbine_sample_coords=turbine_sample_coords,
                         roi_size=power_roi_size,
                         hidden_dim=wind_correction_hidden,
                         feature_hw=feature_hw,
@@ -606,6 +633,7 @@ class MFWPN_Model(nn.Module):
             self.power_head = TurbinePowerHead(
                 in_channels=hid_S,
                 turbine_coords=turbine_coords,
+                turbine_sample_coords=turbine_sample_coords,
                 roi_size=power_roi_size,
                 conv_channels=power_conv_channels,
                 mlp_hidden_dim=power_mlp_hidden,
